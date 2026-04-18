@@ -1,0 +1,8 @@
+<Solution>
+  <Configurations>
+    <Platform Name="ARM64" />
+    <Platform Name="x64" />
+    <Platform Name="x86" />
+  </Configurations>
+  <Project Path="ziOvpo-pz/ziOvpo-pz.vcxproj" Id="9af914b6-300f-4451-800a-0c5c2969dcb9" />
+</Solution>
