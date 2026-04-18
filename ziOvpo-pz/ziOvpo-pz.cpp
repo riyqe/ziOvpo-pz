@@ -1,6 +1,29 @@
 ﻿#include "framework.h"
 #include "ziOvpo-pz.h"
 #include <lmcons.h>
+#include <tlhelp32.h>
+#include <rpc.h>
+#include <cstdlib>
+
+#include "common/AppConfig.h"
+#include "rpc/ServiceControl.h"
+
+#if defined(_M_ARM64)
+extern "C" {
+#include "rpc/ServiceControl_c_arm64.c"
+}
+#elif defined(_M_IX86)
+extern "C" {
+#include "rpc/ServiceControl_c_win32.c"
+}
+#else
+extern "C" {
+#include "rpc/ServiceControl_c_x64.c"
+}
+#endif
+
+#pragma comment(lib, "Rpcrt4.lib")
+#pragma comment(lib, "Advapi32.lib")
 
 HINSTANCE hInst;
 WCHAR szTitle[MAX_LOADSTRING];
@@ -11,6 +34,16 @@ NOTIFYICONDATAW g_notifyIconData{};
 bool g_trayAdded = false;
 bool g_isExiting = false;
 HANDLE g_singleInstanceMutex = nullptr;
+
+extern "C" void* __RPC_USER MIDL_user_allocate(size_t size)
+{
+    return malloc(size);
+}
+
+extern "C" void __RPC_USER MIDL_user_free(void* p)
+{
+    free(p);
+}
 
 std::wstring BuildMutexNamePerUser()
 {
@@ -81,12 +114,195 @@ void ShowTrayContextMenu(HWND hWnd)
     DestroyMenu(hMenu);
 }
 
+bool WaitServiceRunning(SC_HANDLE service)
+{
+    for (int i = 0; i < 200; ++i)
+    {
+        SERVICE_STATUS_PROCESS status{};
+        DWORD bytesNeeded = 0;
+        if (!QueryServiceStatusEx(service, SC_STATUS_PROCESS_INFO, reinterpret_cast<LPBYTE>(&status), sizeof(status), &bytesNeeded))
+        {
+            return false;
+        }
+
+        if (status.dwCurrentState == SERVICE_RUNNING)
+        {
+            return true;
+        }
+
+        Sleep(100);
+    }
+
+    return false;
+}
+
+bool ServiceMustAllowRun()
+{
+    SC_HANDLE scm = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
+    if (!scm)
+    {
+        return false;
+    }
+
+    SC_HANDLE service = OpenServiceW(scm, kServiceName, SERVICE_QUERY_STATUS | SERVICE_START);
+    if (!service)
+    {
+        CloseServiceHandle(scm);
+        return false;
+    }
+
+    SERVICE_STATUS_PROCESS status{};
+    DWORD bytesNeeded = 0;
+    bool allowRun = false;
+
+    if (QueryServiceStatusEx(service, SC_STATUS_PROCESS_INFO, reinterpret_cast<LPBYTE>(&status), sizeof(status), &bytesNeeded))
+    {
+        if (status.dwCurrentState == SERVICE_RUNNING)
+        {
+            allowRun = true;
+        }
+        else
+        {
+            StartServiceW(service, 0, nullptr);
+            WaitServiceRunning(service);
+            allowRun = false;
+        }
+    }
+
+    CloseServiceHandle(service);
+    CloseServiceHandle(scm);
+    return allowRun;
+}
+
+DWORD GetParentPid(DWORD pid)
+{
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE)
+    {
+        return 0;
+    }
+
+    PROCESSENTRY32W pe{};
+    pe.dwSize = sizeof(pe);
+
+    DWORD parent = 0;
+    if (Process32FirstW(snap, &pe))
+    {
+        do
+        {
+            if (pe.th32ProcessID == pid)
+            {
+                parent = pe.th32ParentProcessID;
+                break;
+            }
+        } while (Process32NextW(snap, &pe));
+    }
+
+    CloseHandle(snap);
+    return parent;
+}
+
+std::wstring GetProcessPath(DWORD pid)
+{
+    HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!process)
+    {
+        return L"";
+    }
+
+    wchar_t path[MAX_PATH]{};
+    DWORD size = MAX_PATH;
+    std::wstring result;
+
+    if (QueryFullProcessImageNameW(process, 0, path, &size))
+    {
+        result = path;
+    }
+
+    CloseHandle(process);
+    return result;
+}
+
+bool IsParentService()
+{
+    DWORD parent = GetParentPid(GetCurrentProcessId());
+    if (parent == 0)
+    {
+        return false;
+    }
+
+    std::wstring path = GetProcessPath(parent);
+    if (path.empty())
+    {
+        return false;
+    }
+
+    size_t p = path.find_last_of(L"\\/");
+    std::wstring fileName = (p == std::wstring::npos) ? path : path.substr(p + 1);
+
+    return _wcsicmp(fileName.c_str(), kServiceExeName) == 0;
+}
+
+bool StopServiceByRpc()
+{
+    RPC_WSTR bindingText = nullptr;
+    handle_t binding = nullptr;
+
+    RPC_STATUS s = RpcStringBindingComposeW(
+        nullptr,
+        (RPC_WSTR)L"ncalrpc",
+        nullptr,
+        (RPC_WSTR)kRpcEndpoint,
+        nullptr,
+        &bindingText);
+
+    if (s != RPC_S_OK)
+    {
+        return false;
+    }
+
+    s = RpcBindingFromStringBindingW(bindingText, &binding);
+    RpcStringFreeW(&bindingText);
+    if (s != RPC_S_OK)
+    {
+        return false;
+    }
+
+    bool ok = true;
+
+    RpcTryExcept
+    {
+        RpcRequestStop(binding);
+    }
+    RpcExcept(1)
+    {
+        ok = false;
+    }
+    RpcEndExcept;
+
+    RpcBindingFree(&binding);
+
+    return ok;
+}
+
 int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
                      _In_opt_ HINSTANCE hPrevInstance,
                      _In_ LPWSTR    lpCmdLine,
                      _In_ int       nCmdShow)
 {
     UNREFERENCED_PARAMETER(hPrevInstance);
+
+    const bool debugRun = IsDebuggerPresent() != FALSE;
+
+    if (!debugRun && !ServiceMustAllowRun())
+    {
+        return FALSE;
+    }
+
+    if (!debugRun && !IsParentService())
+    {
+        return FALSE;
+    }
 
     const std::wstring mutexName = BuildMutexNamePerUser();
     g_singleInstanceMutex = CreateMutexW(nullptr, FALSE, mutexName.c_str());
@@ -151,7 +367,7 @@ ATOM MyRegisterClass(HINSTANCE hInstance)
     wcex.hInstance      = hInstance;
     wcex.hIcon          = LoadIcon(hInstance, MAKEINTRESOURCE(IDI_ZIOVPOPZ));
     wcex.hCursor        = LoadCursor(nullptr, IDC_ARROW);
-    wcex.hbrBackground  = (HBRUSH)(COLOR_WINDOW+1);
+    wcex.hbrBackground  = (HBRUSH)(COLOR_WINDOW + 1);
     wcex.lpszMenuName   = MAKEINTRESOURCEW(IDC_ZIOVPOPZ);
     wcex.lpszClassName  = szWindowClass;
     wcex.hIconSm        = LoadIcon(wcex.hInstance, MAKEINTRESOURCE(IDI_SMALL));
@@ -161,23 +377,23 @@ ATOM MyRegisterClass(HINSTANCE hInstance)
 
 BOOL InitInstance(HINSTANCE hInstance, int nCmdShow, bool startHidden)
 {
-   hInst = hInstance;
+    hInst = hInstance;
 
-   HWND hWnd = CreateWindowW(szWindowClass, szTitle, WS_OVERLAPPEDWINDOW,
-      CW_USEDEFAULT, 0, CW_USEDEFAULT, 0, nullptr, nullptr, hInstance, nullptr);
+    HWND hWnd = CreateWindowW(szWindowClass, szTitle, WS_OVERLAPPEDWINDOW,
+        CW_USEDEFAULT, 0, CW_USEDEFAULT, 0, nullptr, nullptr, hInstance, nullptr);
 
-   if (!hWnd)
-   {
-      return FALSE;
-   }
+    if (!hWnd)
+    {
+        return FALSE;
+    }
 
-   if (!startHidden)
-   {
-       ShowWindow(hWnd, nCmdShow);
-       UpdateWindow(hWnd);
-   }
+    if (!startHidden)
+    {
+        ShowWindow(hWnd, nCmdShow);
+        UpdateWindow(hWnd);
+    }
 
-   return TRUE;
+    return TRUE;
 }
 
 LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
@@ -201,26 +417,27 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
         }
         break;
     case WM_COMMAND:
+    {
+        int wmId = LOWORD(wParam);
+        switch (wmId)
         {
-            int wmId = LOWORD(wParam);
-            switch (wmId)
-            {
-            case IDM_ABOUT:
-                DialogBox(hInst, MAKEINTRESOURCE(IDD_ABOUTBOX), hWnd, About);
-                break;
-            case IDM_EXIT:
-            case IDM_TRAY_EXIT:
-                g_isExiting = true;
-                DestroyWindow(hWnd);
-                break;
-            case IDM_TRAY_OPEN:
-                ShowMainWindow(hWnd);
-                break;
-            default:
-                return DefWindowProc(hWnd, message, wParam, lParam);
-            }
+        case IDM_ABOUT:
+            DialogBox(hInst, MAKEINTRESOURCE(IDD_ABOUTBOX), hWnd, About);
+            break;
+        case IDM_EXIT:
+        case IDM_TRAY_EXIT:
+            g_isExiting = true;
+            StopServiceByRpc();
+            DestroyWindow(hWnd);
+            break;
+        case IDM_TRAY_OPEN:
+            ShowMainWindow(hWnd);
+            break;
+        default:
+            return DefWindowProc(hWnd, message, wParam, lParam);
         }
-        break;
+    }
+    break;
     case WM_TRAYICON:
         switch (LOWORD(lParam))
         {
@@ -236,12 +453,13 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
         }
         return 0;
     case WM_PAINT:
-        {
-            PAINTSTRUCT ps;
-            HDC hdc = BeginPaint(hWnd, &ps);
-            EndPaint(hWnd, &ps);
-        }
-        break;
+    {
+        PAINTSTRUCT ps;
+        HDC hdc = BeginPaint(hWnd, &ps);
+        UNREFERENCED_PARAMETER(hdc);
+        EndPaint(hWnd, &ps);
+    }
+    break;
     case WM_DESTROY:
         RemoveTrayIcon();
         PostQuitMessage(0);
