@@ -4,11 +4,14 @@
 #include <tlhelp32.h>
 #include <rpc.h>
 #include <cstdlib>
+#include <array>
+#include <Aclapi.h>
+#include <Accctrl.h>
 
 #include "common/AppConfig.h"
 #include "rpc/ServiceControl.h"
 
-#if defined(_M_ARM64)
+#if defined(_M_ARM64) || defined(_M_ARM64EC)
 extern "C" {
 #include "rpc/ServiceControl_c_arm64.c"
 }
@@ -35,6 +38,55 @@ bool g_trayAdded = false;
 bool g_isExiting = false;
 HANDLE g_singleInstanceMutex = nullptr;
 
+std::wstring GetLogDirectory()
+{
+    wchar_t programData[MAX_PATH]{};
+    DWORD len = GetEnvironmentVariableW(L"ProgramData", programData, MAX_PATH);
+    std::wstring base = len > 0 ? std::wstring(programData, len) : L".";
+    std::wstring dir = base + L"\\ZiOvpoPz";
+    CreateDirectoryW(dir.c_str(), nullptr);
+    return dir;
+}
+
+std::wstring GetLogPath()
+{
+    return GetLogDirectory() + L"\\tray.log";
+}
+
+void LogMessage(const std::wstring& message)
+{
+    const std::wstring path = GetLogPath();
+    if (path.empty())
+    {
+        return;
+    }
+
+    SYSTEMTIME st{};
+    GetLocalTime(&st);
+    wchar_t timestamp[64]{};
+    swprintf_s(timestamp, L"%04u-%02u-%02u %02u:%02u:%02u", st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+
+    std::wstring line = L"[" + std::wstring(timestamp) + L"] " + message + L"\r\n";
+    int size = WideCharToMultiByte(CP_UTF8, 0, line.c_str(), -1, nullptr, 0, nullptr, nullptr);
+    if (size <= 0)
+    {
+        return;
+    }
+
+    std::string bytes(static_cast<size_t>(size - 1), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, line.c_str(), -1, bytes.data(), size, nullptr, nullptr);
+
+    HANDLE file = CreateFileW(path.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE)
+    {
+        return;
+    }
+
+    DWORD written = 0;
+    WriteFile(file, bytes.data(), static_cast<DWORD>(bytes.size()), &written, nullptr);
+    CloseHandle(file);
+}
+
 extern "C" void* __RPC_USER MIDL_user_allocate(size_t size)
 {
     return malloc(size);
@@ -43,6 +95,76 @@ extern "C" void* __RPC_USER MIDL_user_allocate(size_t size)
 extern "C" void __RPC_USER MIDL_user_free(void* p)
 {
     free(p);
+}
+
+bool ApplyProcessDacl()
+{
+    std::array<BYTE, SECURITY_MAX_SID_SIZE> systemSidBuffer{};
+    std::array<BYTE, SECURITY_MAX_SID_SIZE> adminSidBuffer{};
+    std::array<BYTE, SECURITY_MAX_SID_SIZE> usersSidBuffer{};
+    DWORD systemSidSize = static_cast<DWORD>(systemSidBuffer.size());
+    DWORD adminSidSize = static_cast<DWORD>(adminSidBuffer.size());
+    DWORD usersSidSize = static_cast<DWORD>(usersSidBuffer.size());
+
+    if (!CreateWellKnownSid(WinLocalSystemSid, nullptr, systemSidBuffer.data(), &systemSidSize) ||
+        !CreateWellKnownSid(WinBuiltinAdministratorsSid, nullptr, adminSidBuffer.data(), &adminSidSize) ||
+        !CreateWellKnownSid(WinBuiltinUsersSid, nullptr, usersSidBuffer.data(), &usersSidSize))
+    {
+        return false;
+    }
+
+    EXPLICIT_ACCESSW entries[5]{};
+    DWORD count = 0;
+
+    entries[count].grfAccessPermissions = PROCESS_TERMINATE;
+    entries[count].grfAccessMode = DENY_ACCESS;
+    entries[count].grfInheritance = NO_INHERITANCE;
+    entries[count].Trustee.TrusteeForm = TRUSTEE_IS_SID;
+    entries[count].Trustee.ptstrName = reinterpret_cast<LPWSTR>(usersSidBuffer.data());
+    ++count;
+
+    entries[count].grfAccessPermissions = PROCESS_TERMINATE;
+    entries[count].grfAccessMode = DENY_ACCESS;
+    entries[count].grfInheritance = NO_INHERITANCE;
+    entries[count].Trustee.TrusteeForm = TRUSTEE_IS_SID;
+    entries[count].Trustee.ptstrName = reinterpret_cast<LPWSTR>(adminSidBuffer.data());
+    ++count;
+
+    entries[count].grfAccessPermissions = PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE;
+    entries[count].grfAccessMode = SET_ACCESS;
+    entries[count].grfInheritance = NO_INHERITANCE;
+    entries[count].Trustee.TrusteeForm = TRUSTEE_IS_SID;
+    entries[count].Trustee.ptstrName = reinterpret_cast<LPWSTR>(usersSidBuffer.data());
+    ++count;
+
+    entries[count].grfAccessPermissions = PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE;
+    entries[count].grfAccessMode = SET_ACCESS;
+    entries[count].grfInheritance = NO_INHERITANCE;
+    entries[count].Trustee.TrusteeForm = TRUSTEE_IS_SID;
+    entries[count].Trustee.ptstrName = reinterpret_cast<LPWSTR>(adminSidBuffer.data());
+    ++count;
+
+    entries[count].grfAccessPermissions = PROCESS_ALL_ACCESS;
+    entries[count].grfAccessMode = SET_ACCESS;
+    entries[count].grfInheritance = NO_INHERITANCE;
+    entries[count].Trustee.TrusteeForm = TRUSTEE_IS_SID;
+    entries[count].Trustee.ptstrName = reinterpret_cast<LPWSTR>(systemSidBuffer.data());
+    ++count;
+
+    PACL dacl = nullptr;
+    if (SetEntriesInAclW(count, entries, nullptr, &dacl) != ERROR_SUCCESS)
+    {
+        return false;
+    }
+
+    const DWORD result = SetSecurityInfo(GetCurrentProcess(), SE_KERNEL_OBJECT, DACL_SECURITY_INFORMATION, nullptr, nullptr, dacl, nullptr);
+
+    if (dacl)
+    {
+        LocalFree(dacl);
+    }
+
+    return result == ERROR_SUCCESS;
 }
 
 std::wstring BuildMutexNamePerUser()
@@ -294,20 +416,35 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
 
     const bool debugRun = IsDebuggerPresent() != FALSE;
 
-    if (!debugRun && !ServiceMustAllowRun())
+    LogMessage(L"TrayApp starting");
+    if (lpCmdLine)
     {
-        return FALSE;
+        LogMessage(std::wstring(L"Command line: ") + lpCmdLine);
+    }
+    LogMessage(std::wstring(L"Debug run: ") + (debugRun ? L"true" : L"false"));
+
+    if (!debugRun)
+    {
+        if (!IsParentService())
+        {
+            if (!ServiceMustAllowRun())
+            {
+                LogMessage(L"Service check failed, exiting");
+                return FALSE;
+            }
+
+            LogMessage(L"Parent process is not service, exiting");
+            return FALSE;
+        }
     }
 
-    if (!debugRun && !IsParentService())
-    {
-        return FALSE;
-    }
+    ApplyProcessDacl();
 
     const std::wstring mutexName = BuildMutexNamePerUser();
     g_singleInstanceMutex = CreateMutexW(nullptr, FALSE, mutexName.c_str());
     if (!g_singleInstanceMutex || GetLastError() == ERROR_ALREADY_EXISTS)
     {
+        LogMessage(L"Single instance check failed, exiting");
         if (g_singleInstanceMutex)
         {
             CloseHandle(g_singleInstanceMutex);
@@ -315,6 +452,8 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
         }
         return FALSE;
     }
+
+    LogMessage(L"Instance mutex created");
 
     LoadStringW(hInstance, IDS_APP_TITLE, szTitle, MAX_LOADSTRING);
     LoadStringW(hInstance, IDC_ZIOVPOPZ, szWindowClass, MAX_LOADSTRING);
@@ -327,10 +466,13 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
 
     if (!InitInstance(hInstance, nCmdShow, startHidden))
     {
+        LogMessage(L"InitInstance failed");
         CloseHandle(g_singleInstanceMutex);
         g_singleInstanceMutex = nullptr;
         return FALSE;
     }
+
+    LogMessage(L"InitInstance ok, entering message loop");
 
     HACCEL hAccelTable = LoadAccelerators(hInstance, MAKEINTRESOURCE(IDC_ZIOVPOPZ));
 
