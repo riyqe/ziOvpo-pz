@@ -25,6 +25,12 @@
 *.user
 *.userosscache
 *.sln.docstates
+*.tlog
+*.idb
+*.ipch
+*.aps
+*.res
+*.pch
 
 # Binaries
 *.exe
