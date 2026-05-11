@@ -7,7 +7,7 @@
 /* at Tue Jan 19 06:14:07 2038
  */
 /* Compiler settings for ziOvpo-pz/rpc/ServiceControl.idl:
-    Oicf, W1, Zp8, env=Win64 (32b run), target_arch=AMD64 8.01.0628 
+    Oicf, W1, Zp8, env=Win64 (32b run), target_arch=ARM64 8.01.0628 
     protocol : dce , ms_ext, c_ext, robust
     error checks: allocation ref bounds_check enum stub_data 
     VC __declspec() decoration level: 
@@ -62,6 +62,29 @@ extern "C"{
 
 void RpcRequestStop( 
     /* [in] */ handle_t hBinding);
+
+long RpcGetUserInfo( 
+    /* [in] */ handle_t hBinding,
+    /* [out] */ long *isAuthenticated,
+    /* [string][out] */ wchar_t **username);
+
+long RpcLogin( 
+    /* [in] */ handle_t hBinding,
+    /* [string][in] */ const wchar_t *username,
+    /* [string][in] */ const wchar_t *password);
+
+long RpcLogout( 
+    /* [in] */ handle_t hBinding);
+
+long RpcGetLicenseInfo( 
+    /* [in] */ handle_t hBinding,
+    /* [out] */ long *hasLicense,
+    /* [out] */ long *blocked,
+    /* [string][out] */ wchar_t **expirationDate);
+
+long RpcActivate( 
+    /* [in] */ handle_t hBinding,
+    /* [string][in] */ const wchar_t *activationKey);
 
 
 

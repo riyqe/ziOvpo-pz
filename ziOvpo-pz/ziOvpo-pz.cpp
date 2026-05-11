@@ -5,6 +5,7 @@
 #include <rpc.h>
 #include <cstdlib>
 #include <array>
+#include <random>
 #include <Aclapi.h>
 #include <Accctrl.h>
 
@@ -37,6 +38,13 @@ NOTIFYICONDATAW g_notifyIconData{};
 bool g_trayAdded = false;
 bool g_isExiting = false;
 HANDLE g_singleInstanceMutex = nullptr;
+HWND g_statusText = nullptr;
+HWND g_userText = nullptr;
+HWND g_licenseText = nullptr;
+HWND g_expirationText = nullptr;
+bool g_uiFlowRunning = false;
+constexpr UINT WM_APP_STARTUP = WM_APP + 10;
+constexpr UINT WM_APP_REFRESH_LICENSE = WM_APP + 11;
 
 std::wstring GetLogDirectory()
 {
@@ -85,6 +93,176 @@ void LogMessage(const std::wstring& message)
     DWORD written = 0;
     WriteFile(file, bytes.data(), static_cast<DWORD>(bytes.size()), &written, nullptr);
     CloseHandle(file);
+}
+
+void CenterWindow(HWND hWnd);
+
+bool CreateRpcBinding(handle_t& binding)
+{
+    RPC_WSTR bindingText = nullptr;
+    RPC_STATUS status = RpcStringBindingComposeW(
+        nullptr,
+        (RPC_WSTR)L"ncalrpc",
+        nullptr,
+        (RPC_WSTR)kRpcEndpoint,
+        nullptr,
+        &bindingText);
+
+    if (status != RPC_S_OK)
+    {
+        return false;
+    }
+
+    status = RpcBindingFromStringBindingW(bindingText, &binding);
+    RpcStringFreeW(&bindingText);
+    return status == RPC_S_OK;
+}
+
+void FreeRpcBinding(handle_t binding)
+{
+    if (binding)
+    {
+        RpcBindingFree(&binding);
+    }
+}
+
+DWORD RpcCallGetUserInfo(bool& isAuthenticated, std::wstring& username)
+{
+    handle_t binding = nullptr;
+    if (!CreateRpcBinding(binding))
+    {
+        return ERROR_GEN_FAILURE;
+    }
+
+    long auth = 0;
+    wchar_t* name = nullptr;
+    long status = ERROR_GEN_FAILURE;
+
+    RpcTryExcept
+    {
+        status = RpcGetUserInfo(binding, &auth, &name);
+    }
+    RpcExcept(1)
+    {
+        status = ERROR_GEN_FAILURE;
+    }
+    RpcEndExcept;
+
+    FreeRpcBinding(binding);
+
+    if (name)
+    {
+        username = name;
+        MIDL_user_free(name);
+    }
+
+    isAuthenticated = auth != 0;
+    return status;
+}
+
+DWORD RpcCallLogin(const std::wstring& username, const std::wstring& password)
+{
+    handle_t binding = nullptr;
+    if (!CreateRpcBinding(binding))
+    {
+        return ERROR_GEN_FAILURE;
+    }
+
+    long status = ERROR_GEN_FAILURE;
+    RpcTryExcept
+    {
+        status = RpcLogin(binding, username.c_str(), password.c_str());
+    }
+    RpcExcept(1)
+    {
+        status = ERROR_GEN_FAILURE;
+    }
+    RpcEndExcept;
+
+    FreeRpcBinding(binding);
+    return status;
+}
+
+DWORD RpcCallLogout()
+{
+    handle_t binding = nullptr;
+    if (!CreateRpcBinding(binding))
+    {
+        return ERROR_GEN_FAILURE;
+    }
+
+    long status = ERROR_GEN_FAILURE;
+    RpcTryExcept
+    {
+        status = RpcLogout(binding);
+    }
+    RpcExcept(1)
+    {
+        status = ERROR_GEN_FAILURE;
+    }
+    RpcEndExcept;
+
+    FreeRpcBinding(binding);
+    return status;
+}
+
+DWORD RpcCallGetLicenseInfo(bool& hasLicense, bool& blocked, std::wstring& expirationDate)
+{
+    handle_t binding = nullptr;
+    if (!CreateRpcBinding(binding))
+    {
+        return ERROR_GEN_FAILURE;
+    }
+
+    long has = 0;
+    long isBlocked = 0;
+    wchar_t* expiration = nullptr;
+    long status = ERROR_GEN_FAILURE;
+
+    RpcTryExcept
+    {
+        status = RpcGetLicenseInfo(binding, &has, &isBlocked, &expiration);
+    }
+    RpcExcept(1)
+    {
+        status = ERROR_GEN_FAILURE;
+    }
+    RpcEndExcept;
+
+    FreeRpcBinding(binding);
+
+    if (expiration)
+    {
+        expirationDate = expiration;
+        MIDL_user_free(expiration);
+    }
+
+    hasLicense = has != 0;
+    blocked = isBlocked != 0;
+    return status;
+}
+
+DWORD RpcCallActivate(const std::wstring& activationKey)
+{
+    handle_t binding = nullptr;
+    if (!CreateRpcBinding(binding))
+    {
+        return ERROR_GEN_FAILURE;
+    }
+
+    long status = ERROR_GEN_FAILURE;
+    RpcTryExcept
+    {
+        status = RpcActivate(binding, activationKey.c_str());
+    }
+    RpcExcept(1)
+    {
+        status = ERROR_GEN_FAILURE;
+    }
+    RpcEndExcept;
+
+    FreeRpcBinding(binding);
+    return status;
 }
 
 extern "C" void* __RPC_USER MIDL_user_allocate(size_t size)
@@ -181,6 +359,7 @@ std::wstring BuildMutexNamePerUser()
 
 void ShowMainWindow(HWND hWnd)
 {
+    CenterWindow(hWnd);
     ShowWindow(hWnd, SW_SHOW);
     ShowWindow(hWnd, SW_RESTORE);
     SetForegroundWindow(hWnd);
@@ -407,6 +586,287 @@ bool StopServiceByRpc()
     return ok;
 }
 
+struct LoginDialogState
+{
+    std::wstring username;
+    std::wstring password;
+    bool accepted = false;
+};
+
+INT_PTR CALLBACK LoginDialogProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lParam)
+{
+    switch (message)
+    {
+    case WM_INITDIALOG:
+    {
+        auto* state = reinterpret_cast<LoginDialogState*>(lParam);
+        SetWindowLongPtr(hDlg, DWLP_USER, reinterpret_cast<LONG_PTR>(state));
+        CenterWindow(hDlg);
+        SetDlgItemTextW(hDlg, IDC_LOGIN_USERNAME, L"admin");
+        SetDlgItemTextW(hDlg, IDC_LOGIN_PASSWORD, L"admin12345");
+        return (INT_PTR)TRUE;
+    }
+    case WM_COMMAND:
+        if (LOWORD(wParam) == IDOK)
+        {
+            auto* state = reinterpret_cast<LoginDialogState*>(GetWindowLongPtr(hDlg, DWLP_USER));
+            if (!state)
+            {
+                EndDialog(hDlg, IDCANCEL);
+                return (INT_PTR)TRUE;
+            }
+
+            wchar_t username[128]{};
+            wchar_t password[128]{};
+            GetDlgItemTextW(hDlg, IDC_LOGIN_USERNAME, username, ARRAYSIZE(username));
+            GetDlgItemTextW(hDlg, IDC_LOGIN_PASSWORD, password, ARRAYSIZE(password));
+            state->username = username;
+            state->password = password;
+            state->accepted = true;
+            EndDialog(hDlg, IDOK);
+            return (INT_PTR)TRUE;
+        }
+        if (LOWORD(wParam) == IDCANCEL)
+        {
+            EndDialog(hDlg, IDCANCEL);
+            return (INT_PTR)TRUE;
+        }
+        break;
+    }
+    return (INT_PTR)FALSE;
+}
+
+struct ActivationDialogState
+{
+    std::wstring activationKey;
+    bool accepted = false;
+};
+
+INT_PTR CALLBACK ActivationDialogProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lParam)
+{
+    switch (message)
+    {
+    case WM_INITDIALOG:
+    {
+        auto* state = reinterpret_cast<ActivationDialogState*>(lParam);
+        SetWindowLongPtr(hDlg, DWLP_USER, reinterpret_cast<LONG_PTR>(state));
+        CenterWindow(hDlg);
+        if (state)
+        {
+            SetDlgItemTextW(hDlg, IDC_ACTIVATION_KEY, state->activationKey.c_str());
+        }
+        return (INT_PTR)TRUE;
+    }
+    case WM_COMMAND:
+        if (LOWORD(wParam) == IDOK)
+        {
+            auto* state = reinterpret_cast<ActivationDialogState*>(GetWindowLongPtr(hDlg, DWLP_USER));
+            if (!state)
+            {
+                EndDialog(hDlg, IDCANCEL);
+                return (INT_PTR)TRUE;
+            }
+
+            wchar_t key[128]{};
+            GetDlgItemTextW(hDlg, IDC_ACTIVATION_KEY, key, ARRAYSIZE(key));
+            state->activationKey = key;
+            state->accepted = true;
+            EndDialog(hDlg, IDOK);
+            return (INT_PTR)TRUE;
+        }
+        if (LOWORD(wParam) == IDCANCEL)
+        {
+            EndDialog(hDlg, IDCANCEL);
+            return (INT_PTR)TRUE;
+        }
+        break;
+    }
+    return (INT_PTR)FALSE;
+}
+
+bool ShowLoginDialog(HWND owner, std::wstring& username, std::wstring& password)
+{
+    LoginDialogState state{};
+    DialogBoxParamW(hInst, MAKEINTRESOURCEW(IDD_LOGIN_DIALOG), owner, LoginDialogProc, reinterpret_cast<LPARAM>(&state));
+    if (!state.accepted)
+    {
+        return false;
+    }
+
+    username = state.username;
+    password = state.password;
+    return true;
+}
+
+bool ShowActivationDialog(HWND owner, std::wstring& activationKey)
+{
+    ActivationDialogState state{};
+    state.activationKey = activationKey;
+    DialogBoxParamW(hInst, MAKEINTRESOURCEW(IDD_ACTIVATE_DIALOG), owner, ActivationDialogProc, reinterpret_cast<LPARAM>(&state));
+    if (!state.accepted)
+    {
+        return false;
+    }
+
+    activationKey = state.activationKey;
+    return true;
+}
+
+void UpdateStatusText(const std::wstring& status)
+{
+    if (g_statusText)
+    {
+        SetWindowTextW(g_statusText, status.c_str());
+    }
+}
+
+void UpdateUserText(const std::wstring& username)
+{
+    if (g_userText)
+    {
+        SetWindowTextW(g_userText, (L"Пользователь: " + username).c_str());
+    }
+}
+
+void UpdateLicenseText(const std::wstring& text)
+{
+    if (g_licenseText)
+    {
+        SetWindowTextW(g_licenseText, text.c_str());
+    }
+}
+
+void UpdateExpirationText(const std::wstring& text)
+{
+    if (g_expirationText)
+    {
+        SetWindowTextW(g_expirationText, text.c_str());
+    }
+}
+
+void CenterWindow(HWND hWnd)
+{
+    RECT rect{};
+    if (!GetWindowRect(hWnd, &rect))
+    {
+        return;
+    }
+
+    int width = rect.right - rect.left;
+    int height = rect.bottom - rect.top;
+
+    int screenWidth = GetSystemMetrics(SM_CXSCREEN);
+    int screenHeight = GetSystemMetrics(SM_CYSCREEN);
+
+    int x = (screenWidth - width) / 2;
+    int y = (screenHeight - height) / 2;
+
+    SetWindowPos(hWnd, nullptr, x, y, 0, 0, SWP_NOZORDER | SWP_NOSIZE);
+}
+
+bool EnsureAuthenticated(HWND hWnd, std::wstring& username)
+{
+    bool authenticated = false;
+    std::wstring currentUser;
+    DWORD status = RpcCallGetUserInfo(authenticated, currentUser);
+    if (status == ERROR_SUCCESS && authenticated)
+    {
+        username = currentUser;
+        return true;
+    }
+
+    UpdateStatusText(L"Статус: требуется вход");
+    UpdateUserText(L"-");
+    UpdateLicenseText(L"Лицензия: неизвестно");
+    UpdateExpirationText(L"Срок действия: -");
+
+    while (true)
+    {
+        std::wstring login;
+        std::wstring password;
+        if (!ShowLoginDialog(hWnd, login, password))
+        {
+            return false;
+        }
+
+        DWORD loginStatus = RpcCallLogin(login, password);
+        if (loginStatus == ERROR_SUCCESS)
+        {
+            username = login;
+            return true;
+        }
+
+        MessageBoxW(hWnd, L"Ошибка входа. Проверьте логин и пароль.", L"Вход", MB_OK | MB_ICONERROR);
+    }
+}
+
+bool EnsureLicense(HWND hWnd, const std::wstring& username)
+{
+    UpdateUserText(username);
+    UpdateStatusText(L"Статус: проверка лицензии");
+
+    while (true)
+    {
+        bool hasLicense = false;
+        bool blocked = false;
+        std::wstring expiration;
+        DWORD status = RpcCallGetLicenseInfo(hasLicense, blocked, expiration);
+        if (status == ERROR_SUCCESS && hasLicense && !blocked)
+        {
+            UpdateLicenseText(L"Лицензия: активна");
+            UpdateExpirationText(L"Срок действия: " + expiration);
+            UpdateStatusText(L"Антивирус активен");
+            return true;
+        }
+
+        if (status == ERROR_SUCCESS && hasLicense && blocked)
+        {
+            UpdateLicenseText(L"Лицензия: заблокирована");
+        }
+        else
+        {
+            UpdateLicenseText(L"Лицензия: отсутствует");
+        }
+
+        UpdateExpirationText(L"Срок действия: -");
+        UpdateStatusText(L"Антивирус заблокирован");
+
+        std::wstring activationKey;
+        if (!ShowActivationDialog(hWnd, activationKey))
+        {
+            return false;
+        }
+
+        DWORD activateStatus = RpcCallActivate(activationKey);
+        if (activateStatus == ERROR_SUCCESS)
+        {
+            continue;
+        }
+
+        MessageBoxW(hWnd, L"Ошибка активации. Нужен действительный activationKey из сервера.", L"Активация", MB_OK | MB_ICONERROR);
+    }
+}
+
+void RefreshLicenseStatus(HWND hWnd)
+{
+    if (g_uiFlowRunning)
+    {
+        return;
+    }
+
+    g_uiFlowRunning = true;
+
+    std::wstring username;
+    if (!EnsureAuthenticated(hWnd, username))
+    {
+        g_uiFlowRunning = false;
+        return;
+    }
+
+    EnsureLicense(hWnd, username);
+    g_uiFlowRunning = false;
+}
+
 int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
                      _In_opt_ HINSTANCE hPrevInstance,
                      _In_ LPWSTR    lpCmdLine,
@@ -531,6 +991,7 @@ BOOL InitInstance(HINSTANCE hInstance, int nCmdShow, bool startHidden)
 
     if (!startHidden)
     {
+        CenterWindow(hWnd);
         ShowWindow(hWnd, nCmdShow);
         UpdateWindow(hWnd);
     }
@@ -550,6 +1011,16 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
     {
     case WM_CREATE:
         AddTrayIcon(hWnd);
+        g_statusText = CreateWindowW(L"STATIC", L"Статус: -", WS_CHILD | WS_VISIBLE,
+            10, 10, 320, 20, hWnd, reinterpret_cast<HMENU>(IDC_STATUS_TEXT), hInst, nullptr);
+        g_userText = CreateWindowW(L"STATIC", L"Пользователь: -", WS_CHILD | WS_VISIBLE,
+            10, 35, 320, 20, hWnd, reinterpret_cast<HMENU>(IDC_USER_TEXT), hInst, nullptr);
+        g_licenseText = CreateWindowW(L"STATIC", L"Лицензия: -", WS_CHILD | WS_VISIBLE,
+            10, 60, 320, 20, hWnd, reinterpret_cast<HMENU>(IDC_LICENSE_TEXT), hInst, nullptr);
+        g_expirationText = CreateWindowW(L"STATIC", L"Срок действия: -", WS_CHILD | WS_VISIBLE,
+            10, 85, 320, 20, hWnd, reinterpret_cast<HMENU>(IDC_EXPIRATION_TEXT), hInst, nullptr);
+        SetTimer(hWnd, 1, 30000, nullptr);
+        PostMessageW(hWnd, WM_APP_STARTUP, 0, 0);
         break;
     case WM_CLOSE:
         if (!g_isExiting)
@@ -572,6 +1043,10 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
             StopServiceByRpc();
             DestroyWindow(hWnd);
             break;
+        case IDM_LOGOUT:
+            RpcCallLogout();
+            PostMessageW(hWnd, WM_APP_STARTUP, 0, 0);
+            break;
         case IDM_TRAY_OPEN:
             ShowMainWindow(hWnd);
             break;
@@ -580,6 +1055,15 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
         }
     }
     break;
+    case WM_TIMER:
+        if (wParam == 1)
+        {
+            RefreshLicenseStatus(hWnd);
+        }
+        break;
+    case WM_APP_STARTUP:
+        RefreshLicenseStatus(hWnd);
+        break;
     case WM_TRAYICON:
         switch (LOWORD(lParam))
         {
@@ -604,6 +1088,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
     break;
     case WM_DESTROY:
         RemoveTrayIcon();
+        KillTimer(hWnd, 1);
         PostQuitMessage(0);
         break;
     default:

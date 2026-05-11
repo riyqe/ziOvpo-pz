@@ -3,6 +3,9 @@
 /build-*/
 /out/
 /artifact/
+/ARM64/
+/x64/
+/Win32/
 
 # CMake
 /CMakeFiles/
@@ -19,6 +22,7 @@
 
 # Visual Studio
 /.vs/
+/.vscode/
 *.VC.db
 *.VC.opendb
 *.suo

@@ -30,4 +30,4 @@ target_include_directories(ZiOvpoPzService PRIVATE
     ziOvpo-pz/rpc
 )
 target_compile_definitions(ZiOvpoPzService PRIVATE UNICODE _UNICODE)
-target_link_libraries(ZiOvpoPzService PRIVATE rpcrt4 wtsapi32 userenv advapi32)
+target_link_libraries(ZiOvpoPzService PRIVATE rpcrt4 wtsapi32 userenv advapi32 winhttp iphlpapi crypt32)
