@@ -1,6 +1,37 @@
 ﻿#include "framework.h"
 #include "ziOvpo-pz.h"
 #include <lmcons.h>
+#include <tlhelp32.h>
+#include <rpc.h>
+#include <cstdlib>
+#include <array>
+#include <random>
+#include <mutex>
+#include <commdlg.h>
+#include <shlobj.h>
+#include <Aclapi.h>
+#include <Accctrl.h>
+
+#include "common/AppConfig.h"
+#include "AvEngine.h"
+#include "rpc/ServiceControl.h"
+
+#if defined(_M_ARM64) || defined(_M_ARM64EC)
+extern "C" {
+#include "rpc/ServiceControl_c_arm64.c"
+}
+#elif defined(_M_IX86)
+extern "C" {
+#include "rpc/ServiceControl_c_win32.c"
+}
+#else
+extern "C" {
+#include "rpc/ServiceControl_c_x64.c"
+}
+#endif
+
+#pragma comment(lib, "Rpcrt4.lib")
+#pragma comment(lib, "Advapi32.lib")
 
 HINSTANCE hInst;
 WCHAR szTitle[MAX_LOADSTRING];
@@ -11,6 +42,394 @@ NOTIFYICONDATAW g_notifyIconData{};
 bool g_trayAdded = false;
 bool g_isExiting = false;
 HANDLE g_singleInstanceMutex = nullptr;
+HWND g_statusText = nullptr;
+HWND g_userText = nullptr;
+HWND g_licenseText = nullptr;
+HWND g_expirationText = nullptr;
+HWND g_avStatusText = nullptr;
+bool g_uiFlowRunning = false;
+bool g_avDatabaseLoaded = false;
+bool g_scheduleEnabled = false;
+unsigned int g_scheduleIntervalMinutes = 60;
+av::AvDatabase g_avDatabase{};
+std::vector<av::ScanFinding> g_lastScanResults;
+std::vector<std::wstring> g_monitoredDirectories;
+std::vector<HANDLE> g_monitorStopEvents;
+std::vector<HANDLE> g_monitorThreads;
+std::mutex g_stateMutex;
+constexpr UINT_PTR kScheduleTimerId = 2;
+constexpr UINT WM_APP_STARTUP = WM_APP + 10;
+constexpr UINT WM_APP_REFRESH_LICENSE = WM_APP + 11;
+
+std::wstring GetLogDirectory()
+{
+    wchar_t programData[MAX_PATH]{};
+    DWORD len = GetEnvironmentVariableW(L"ProgramData", programData, MAX_PATH);
+    std::wstring base = len > 0 ? std::wstring(programData, len) : L".";
+    std::wstring dir = base + L"\\ZiOvpoPz";
+    CreateDirectoryW(dir.c_str(), nullptr);
+    return dir;
+}
+
+std::wstring GetLogPath()
+{
+    return GetLogDirectory() + L"\\tray.log";
+}
+
+void LogMessage(const std::wstring& message)
+{
+    const std::wstring path = GetLogPath();
+    if (path.empty())
+    {
+        return;
+    }
+
+    SYSTEMTIME st{};
+    GetLocalTime(&st);
+    wchar_t timestamp[64]{};
+    swprintf_s(timestamp, L"%04u-%02u-%02u %02u:%02u:%02u", st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+
+    std::wstring line = L"[" + std::wstring(timestamp) + L"] " + message + L"\r\n";
+    int size = WideCharToMultiByte(CP_UTF8, 0, line.c_str(), -1, nullptr, 0, nullptr, nullptr);
+    if (size <= 0)
+    {
+        return;
+    }
+
+    std::string bytes(static_cast<size_t>(size - 1), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, line.c_str(), -1, bytes.data(), size, nullptr, nullptr);
+
+    HANDLE file = CreateFileW(path.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE)
+    {
+        return;
+    }
+
+    DWORD written = 0;
+    WriteFile(file, bytes.data(), static_cast<DWORD>(bytes.size()), &written, nullptr);
+    CloseHandle(file);
+}
+
+void CenterWindow(HWND hWnd);
+
+bool CreateRpcBinding(handle_t& binding)
+{
+    RPC_WSTR bindingText = nullptr;
+    RPC_STATUS status = RpcStringBindingComposeW(
+        nullptr,
+        (RPC_WSTR)L"ncalrpc",
+        nullptr,
+        (RPC_WSTR)kRpcEndpoint,
+        nullptr,
+        &bindingText);
+
+    if (status != RPC_S_OK)
+    {
+        return false;
+    }
+
+    status = RpcBindingFromStringBindingW(bindingText, &binding);
+    RpcStringFreeW(&bindingText);
+    return status == RPC_S_OK;
+}
+
+void FreeRpcBinding(handle_t binding)
+{
+    if (binding)
+    {
+        RpcBindingFree(&binding);
+    }
+}
+
+DWORD RpcCallGetUserInfo(bool& isAuthenticated, std::wstring& username)
+{
+    handle_t binding = nullptr;
+    if (!CreateRpcBinding(binding))
+    {
+        return ERROR_GEN_FAILURE;
+    }
+
+    long auth = 0;
+    wchar_t* name = nullptr;
+    long status = ERROR_GEN_FAILURE;
+
+    RpcTryExcept
+    {
+        status = RpcGetUserInfo(binding, &auth, &name);
+    }
+    RpcExcept(1)
+    {
+        status = ERROR_GEN_FAILURE;
+    }
+    RpcEndExcept;
+
+    FreeRpcBinding(binding);
+
+    if (name)
+    {
+        username = name;
+        MIDL_user_free(name);
+    }
+
+    isAuthenticated = auth != 0;
+    return status;
+}
+
+DWORD RpcCallLogin(const std::wstring& username, const std::wstring& password)
+{
+    handle_t binding = nullptr;
+    if (!CreateRpcBinding(binding))
+    {
+        return ERROR_GEN_FAILURE;
+    }
+
+    long status = ERROR_GEN_FAILURE;
+    RpcTryExcept
+    {
+        status = RpcLogin(binding, username.c_str(), password.c_str());
+    }
+    RpcExcept(1)
+    {
+        status = ERROR_GEN_FAILURE;
+    }
+    RpcEndExcept;
+
+    FreeRpcBinding(binding);
+    return status;
+}
+
+DWORD RpcCallLogout()
+{
+    handle_t binding = nullptr;
+    if (!CreateRpcBinding(binding))
+    {
+        return ERROR_GEN_FAILURE;
+    }
+
+    long status = ERROR_GEN_FAILURE;
+    RpcTryExcept
+    {
+        status = RpcLogout(binding);
+    }
+    RpcExcept(1)
+    {
+        status = ERROR_GEN_FAILURE;
+    }
+    RpcEndExcept;
+
+    FreeRpcBinding(binding);
+    return status;
+}
+
+DWORD RpcCallGetLicenseInfo(bool& hasLicense, bool& blocked, std::wstring& expirationDate)
+{
+    handle_t binding = nullptr;
+    if (!CreateRpcBinding(binding))
+    {
+        return ERROR_GEN_FAILURE;
+    }
+
+    long has = 0;
+    long isBlocked = 0;
+    wchar_t* expiration = nullptr;
+    long status = ERROR_GEN_FAILURE;
+
+    RpcTryExcept
+    {
+        status = RpcGetLicenseInfo(binding, &has, &isBlocked, &expiration);
+    }
+    RpcExcept(1)
+    {
+        status = ERROR_GEN_FAILURE;
+    }
+    RpcEndExcept;
+
+    FreeRpcBinding(binding);
+
+    if (expiration)
+    {
+        expirationDate = expiration;
+        MIDL_user_free(expiration);
+    }
+
+    hasLicense = has != 0;
+    blocked = isBlocked != 0;
+    return status;
+}
+
+DWORD RpcCallActivate(const std::wstring& activationKey)
+{
+    handle_t binding = nullptr;
+    if (!CreateRpcBinding(binding))
+    {
+        return ERROR_GEN_FAILURE;
+    }
+
+    long status = ERROR_GEN_FAILURE;
+    RpcTryExcept
+    {
+        status = RpcActivate(binding, activationKey.c_str());
+    }
+    RpcExcept(1)
+    {
+        status = ERROR_GEN_FAILURE;
+    }
+    RpcEndExcept;
+
+    FreeRpcBinding(binding);
+    return status;
+}
+
+long RpcGetAvDatabaseInfo(handle_t, long* isLoaded, wchar_t** releaseDate, long* recordCount)
+{
+    if (!isLoaded || !releaseDate || !recordCount)
+    {
+        return ERROR_INVALID_PARAMETER;
+    }
+
+    *isLoaded = g_avDatabaseLoaded ? 1 : 0;
+    const std::size_t count = [&]()
+    {
+        std::size_t total = 0;
+        for (const auto& [_, records] : g_avDatabase.records)
+        {
+            total += records.size();
+        }
+        return total;
+    }();
+    *recordCount = static_cast<long>(count);
+
+    const std::wstring text = g_avDatabaseLoaded ? av::FormatReleaseDate(g_avDatabase.releaseDate) : L"-";
+    *releaseDate = reinterpret_cast<wchar_t*>(MIDL_user_allocate((text.size() + 1) * sizeof(wchar_t)));
+    if (!*releaseDate)
+    {
+        return ERROR_OUTOFMEMORY;
+    }
+
+    wcscpy_s(*releaseDate, text.size() + 1, text.c_str());
+    return ERROR_SUCCESS;
+}
+
+long RpcScanPath(handle_t, const wchar_t* path, long isFolder, long* infected, wchar_t** summary)
+{
+    if (!path || !infected || !summary)
+    {
+        return ERROR_INVALID_PARAMETER;
+    }
+
+    *infected = 0;
+    g_lastScanResults.clear();
+    std::wstring text;
+
+    if (isFolder != 0)
+    {
+        text = av::ScanFolder(path, g_avDatabase, g_lastScanResults);
+        *infected = g_lastScanResults.empty() ? 0 : 1;
+    }
+    else
+    {
+        av::ScanFinding finding{};
+        if (av::ScanFile(path, g_avDatabase, finding) && finding.infected)
+        {
+            g_lastScanResults.push_back(finding);
+            *infected = 1;
+            text = L"Файл признан вредоносным.";
+        }
+        else
+        {
+            text = L"Вредоносные сигнатуры не найдены.";
+        }
+    }
+
+    *summary = reinterpret_cast<wchar_t*>(MIDL_user_allocate((text.size() + 1) * sizeof(wchar_t)));
+    if (!*summary)
+    {
+        return ERROR_OUTOFMEMORY;
+    }
+
+    wcscpy_s(*summary, text.size() + 1, text.c_str());
+    return ERROR_SUCCESS;
+}
+
+extern "C" void* __RPC_USER MIDL_user_allocate(size_t size)
+{
+    return malloc(size);
+}
+
+extern "C" void __RPC_USER MIDL_user_free(void* p)
+{
+    free(p);
+}
+
+bool ApplyProcessDacl()
+{
+    std::array<BYTE, SECURITY_MAX_SID_SIZE> systemSidBuffer{};
+    std::array<BYTE, SECURITY_MAX_SID_SIZE> adminSidBuffer{};
+    std::array<BYTE, SECURITY_MAX_SID_SIZE> usersSidBuffer{};
+    DWORD systemSidSize = static_cast<DWORD>(systemSidBuffer.size());
+    DWORD adminSidSize = static_cast<DWORD>(adminSidBuffer.size());
+    DWORD usersSidSize = static_cast<DWORD>(usersSidBuffer.size());
+
+    if (!CreateWellKnownSid(WinLocalSystemSid, nullptr, systemSidBuffer.data(), &systemSidSize) ||
+        !CreateWellKnownSid(WinBuiltinAdministratorsSid, nullptr, adminSidBuffer.data(), &adminSidSize) ||
+        !CreateWellKnownSid(WinBuiltinUsersSid, nullptr, usersSidBuffer.data(), &usersSidSize))
+    {
+        return false;
+    }
+
+    EXPLICIT_ACCESSW entries[5]{};
+    DWORD count = 0;
+
+    entries[count].grfAccessPermissions = PROCESS_TERMINATE;
+    entries[count].grfAccessMode = DENY_ACCESS;
+    entries[count].grfInheritance = NO_INHERITANCE;
+    entries[count].Trustee.TrusteeForm = TRUSTEE_IS_SID;
+    entries[count].Trustee.ptstrName = reinterpret_cast<LPWSTR>(usersSidBuffer.data());
+    ++count;
+
+    entries[count].grfAccessPermissions = PROCESS_TERMINATE;
+    entries[count].grfAccessMode = DENY_ACCESS;
+    entries[count].grfInheritance = NO_INHERITANCE;
+    entries[count].Trustee.TrusteeForm = TRUSTEE_IS_SID;
+    entries[count].Trustee.ptstrName = reinterpret_cast<LPWSTR>(adminSidBuffer.data());
+    ++count;
+
+    entries[count].grfAccessPermissions = PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE;
+    entries[count].grfAccessMode = SET_ACCESS;
+    entries[count].grfInheritance = NO_INHERITANCE;
+    entries[count].Trustee.TrusteeForm = TRUSTEE_IS_SID;
+    entries[count].Trustee.ptstrName = reinterpret_cast<LPWSTR>(usersSidBuffer.data());
+    ++count;
+
+    entries[count].grfAccessPermissions = PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE;
+    entries[count].grfAccessMode = SET_ACCESS;
+    entries[count].grfInheritance = NO_INHERITANCE;
+    entries[count].Trustee.TrusteeForm = TRUSTEE_IS_SID;
+    entries[count].Trustee.ptstrName = reinterpret_cast<LPWSTR>(adminSidBuffer.data());
+    ++count;
+
+    entries[count].grfAccessPermissions = PROCESS_ALL_ACCESS;
+    entries[count].grfAccessMode = SET_ACCESS;
+    entries[count].grfInheritance = NO_INHERITANCE;
+    entries[count].Trustee.TrusteeForm = TRUSTEE_IS_SID;
+    entries[count].Trustee.ptstrName = reinterpret_cast<LPWSTR>(systemSidBuffer.data());
+    ++count;
+
+    PACL dacl = nullptr;
+    if (SetEntriesInAclW(count, entries, nullptr, &dacl) != ERROR_SUCCESS)
+    {
+        return false;
+    }
+
+    const DWORD result = SetSecurityInfo(GetCurrentProcess(), SE_KERNEL_OBJECT, DACL_SECURITY_INFORMATION, nullptr, nullptr, dacl, nullptr);
+
+    if (dacl)
+    {
+        LocalFree(dacl);
+    }
+
+    return result == ERROR_SUCCESS;
+}
 
 std::wstring BuildMutexNamePerUser()
 {
@@ -26,6 +445,7 @@ std::wstring BuildMutexNamePerUser()
 
 void ShowMainWindow(HWND hWnd)
 {
+    CenterWindow(hWnd);
     ShowWindow(hWnd, SW_SHOW);
     ShowWindow(hWnd, SW_RESTORE);
     SetForegroundWindow(hWnd);
@@ -81,6 +501,799 @@ void ShowTrayContextMenu(HWND hWnd)
     DestroyMenu(hMenu);
 }
 
+bool WaitServiceRunning(SC_HANDLE service)
+{
+    for (int i = 0; i < 200; ++i)
+    {
+        SERVICE_STATUS_PROCESS status{};
+        DWORD bytesNeeded = 0;
+        if (!QueryServiceStatusEx(service, SC_STATUS_PROCESS_INFO, reinterpret_cast<LPBYTE>(&status), sizeof(status), &bytesNeeded))
+        {
+            return false;
+        }
+
+        if (status.dwCurrentState == SERVICE_RUNNING)
+        {
+            return true;
+        }
+
+        Sleep(100);
+    }
+
+    return false;
+}
+
+bool ServiceMustAllowRun()
+{
+    SC_HANDLE scm = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
+    if (!scm)
+    {
+        return false;
+    }
+
+    SC_HANDLE service = OpenServiceW(scm, kServiceName, SERVICE_QUERY_STATUS | SERVICE_START);
+    if (!service)
+    {
+        CloseServiceHandle(scm);
+        return false;
+    }
+
+    SERVICE_STATUS_PROCESS status{};
+    DWORD bytesNeeded = 0;
+    bool allowRun = false;
+
+    if (QueryServiceStatusEx(service, SC_STATUS_PROCESS_INFO, reinterpret_cast<LPBYTE>(&status), sizeof(status), &bytesNeeded))
+    {
+        if (status.dwCurrentState == SERVICE_RUNNING)
+        {
+            allowRun = true;
+        }
+        else
+        {
+            StartServiceW(service, 0, nullptr);
+            WaitServiceRunning(service);
+            allowRun = false;
+        }
+    }
+
+    CloseServiceHandle(service);
+    CloseServiceHandle(scm);
+    return allowRun;
+}
+
+DWORD GetParentPid(DWORD pid)
+{
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE)
+    {
+        return 0;
+    }
+
+    PROCESSENTRY32W pe{};
+    pe.dwSize = sizeof(pe);
+
+    DWORD parent = 0;
+    if (Process32FirstW(snap, &pe))
+    {
+        do
+        {
+            if (pe.th32ProcessID == pid)
+            {
+                parent = pe.th32ParentProcessID;
+                break;
+            }
+        } while (Process32NextW(snap, &pe));
+    }
+
+    CloseHandle(snap);
+    return parent;
+}
+
+std::wstring GetProcessPath(DWORD pid)
+{
+    HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!process)
+    {
+        return L"";
+    }
+
+    wchar_t path[MAX_PATH]{};
+    DWORD size = MAX_PATH;
+    std::wstring result;
+
+    if (QueryFullProcessImageNameW(process, 0, path, &size))
+    {
+        result = path;
+    }
+
+    CloseHandle(process);
+    return result;
+}
+
+bool IsParentService()
+{
+    DWORD parent = GetParentPid(GetCurrentProcessId());
+    if (parent == 0)
+    {
+        return false;
+    }
+
+    std::wstring path = GetProcessPath(parent);
+    if (path.empty())
+    {
+        return false;
+    }
+
+    size_t p = path.find_last_of(L"\\/");
+    std::wstring fileName = (p == std::wstring::npos) ? path : path.substr(p + 1);
+
+    return _wcsicmp(fileName.c_str(), kServiceExeName) == 0;
+}
+
+bool StopServiceByRpc()
+{
+    RPC_WSTR bindingText = nullptr;
+    handle_t binding = nullptr;
+
+    RPC_STATUS s = RpcStringBindingComposeW(
+        nullptr,
+        (RPC_WSTR)L"ncalrpc",
+        nullptr,
+        (RPC_WSTR)kRpcEndpoint,
+        nullptr,
+        &bindingText);
+
+    if (s != RPC_S_OK)
+    {
+        return false;
+    }
+
+    s = RpcBindingFromStringBindingW(bindingText, &binding);
+    RpcStringFreeW(&bindingText);
+    if (s != RPC_S_OK)
+    {
+        return false;
+    }
+
+    bool ok = true;
+
+    RpcTryExcept
+    {
+        RpcRequestStop(binding);
+    }
+    RpcExcept(1)
+    {
+        ok = false;
+    }
+    RpcEndExcept;
+
+    RpcBindingFree(&binding);
+
+    return ok;
+}
+
+struct LoginDialogState
+{
+    std::wstring username;
+    std::wstring password;
+    bool accepted = false;
+};
+
+INT_PTR CALLBACK LoginDialogProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lParam)
+{
+    switch (message)
+    {
+    case WM_INITDIALOG:
+    {
+        auto* state = reinterpret_cast<LoginDialogState*>(lParam);
+        SetWindowLongPtr(hDlg, DWLP_USER, reinterpret_cast<LONG_PTR>(state));
+        CenterWindow(hDlg);
+        SetDlgItemTextW(hDlg, IDC_LOGIN_USERNAME, L"admin");
+        SetDlgItemTextW(hDlg, IDC_LOGIN_PASSWORD, L"admin12345");
+        return (INT_PTR)TRUE;
+    }
+    case WM_COMMAND:
+        if (LOWORD(wParam) == IDOK)
+        {
+            auto* state = reinterpret_cast<LoginDialogState*>(GetWindowLongPtr(hDlg, DWLP_USER));
+            if (!state)
+            {
+                EndDialog(hDlg, IDCANCEL);
+                return (INT_PTR)TRUE;
+            }
+
+            wchar_t username[128]{};
+            wchar_t password[128]{};
+            GetDlgItemTextW(hDlg, IDC_LOGIN_USERNAME, username, ARRAYSIZE(username));
+            GetDlgItemTextW(hDlg, IDC_LOGIN_PASSWORD, password, ARRAYSIZE(password));
+            state->username = username;
+            state->password = password;
+            state->accepted = true;
+            EndDialog(hDlg, IDOK);
+            return (INT_PTR)TRUE;
+        }
+        if (LOWORD(wParam) == IDCANCEL)
+        {
+            EndDialog(hDlg, IDCANCEL);
+            return (INT_PTR)TRUE;
+        }
+        break;
+    }
+    return (INT_PTR)FALSE;
+}
+
+struct ActivationDialogState
+{
+    std::wstring activationKey;
+    bool accepted = false;
+};
+
+INT_PTR CALLBACK ActivationDialogProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lParam)
+{
+    switch (message)
+    {
+    case WM_INITDIALOG:
+    {
+        auto* state = reinterpret_cast<ActivationDialogState*>(lParam);
+        SetWindowLongPtr(hDlg, DWLP_USER, reinterpret_cast<LONG_PTR>(state));
+        CenterWindow(hDlg);
+        if (state)
+        {
+            SetDlgItemTextW(hDlg, IDC_ACTIVATION_KEY, state->activationKey.c_str());
+        }
+        return (INT_PTR)TRUE;
+    }
+    case WM_COMMAND:
+        if (LOWORD(wParam) == IDOK)
+        {
+            auto* state = reinterpret_cast<ActivationDialogState*>(GetWindowLongPtr(hDlg, DWLP_USER));
+            if (!state)
+            {
+                EndDialog(hDlg, IDCANCEL);
+                return (INT_PTR)TRUE;
+            }
+
+            wchar_t key[128]{};
+            GetDlgItemTextW(hDlg, IDC_ACTIVATION_KEY, key, ARRAYSIZE(key));
+            state->activationKey = key;
+            state->accepted = true;
+            EndDialog(hDlg, IDOK);
+            return (INT_PTR)TRUE;
+        }
+        if (LOWORD(wParam) == IDCANCEL)
+        {
+            EndDialog(hDlg, IDCANCEL);
+            return (INT_PTR)TRUE;
+        }
+        break;
+    }
+    return (INT_PTR)FALSE;
+}
+
+bool ShowLoginDialog(HWND owner, std::wstring& username, std::wstring& password)
+{
+    LoginDialogState state{};
+    DialogBoxParamW(hInst, MAKEINTRESOURCEW(IDD_LOGIN_DIALOG), owner, LoginDialogProc, reinterpret_cast<LPARAM>(&state));
+    if (!state.accepted)
+    {
+        return false;
+    }
+
+    username = state.username;
+    password = state.password;
+    return true;
+}
+
+bool ShowActivationDialog(HWND owner, std::wstring& activationKey)
+{
+    ActivationDialogState state{};
+    state.activationKey = activationKey;
+    DialogBoxParamW(hInst, MAKEINTRESOURCEW(IDD_ACTIVATE_DIALOG), owner, ActivationDialogProc, reinterpret_cast<LPARAM>(&state));
+    if (!state.accepted)
+    {
+        return false;
+    }
+
+    activationKey = state.activationKey;
+    return true;
+}
+
+void UpdateStatusText(const std::wstring& status)
+{
+    if (g_statusText)
+    {
+        SetWindowTextW(g_statusText, status.c_str());
+    }
+}
+
+void UpdateUserText(const std::wstring& username)
+{
+    if (g_userText)
+    {
+        SetWindowTextW(g_userText, (L"Пользователь: " + username).c_str());
+    }
+}
+
+void UpdateLicenseText(const std::wstring& text)
+{
+    if (g_licenseText)
+    {
+        SetWindowTextW(g_licenseText, text.c_str());
+    }
+}
+
+void UpdateExpirationText(const std::wstring& text)
+{
+    if (g_expirationText)
+    {
+        SetWindowTextW(g_expirationText, text.c_str());
+    }
+}
+
+void UpdateAvStatusText(const std::wstring& text)
+{
+    if (g_avStatusText)
+    {
+        SetWindowTextW(g_avStatusText, text.c_str());
+    }
+}
+
+void UpdateAvStatusText()
+{
+    if (!g_avDatabaseLoaded)
+    {
+        UpdateAvStatusText(L"Антивирусные базы: не загружены");
+        return;
+    }
+
+    const std::size_t recordCount = [&]()
+    {
+        std::size_t count = 0;
+        for (const auto& [_, records] : g_avDatabase.records)
+        {
+            count += records.size();
+        }
+        return count;
+    }();
+
+    UpdateAvStatusText(L"Антивирусные базы: " + av::FormatReleaseDate(g_avDatabase.releaseDate) + L", записей: " + std::to_wstring(recordCount));
+}
+
+void LoadAvDatabase()
+{
+    g_avDatabase = av::CreateDefaultDatabase();
+    g_avDatabaseLoaded = true;
+    UpdateAvStatusText();
+}
+
+std::vector<std::wstring> GetMonitoredDirectoriesSnapshot()
+{
+    std::lock_guard<std::mutex> lock(g_stateMutex);
+    return g_monitoredDirectories;
+}
+
+std::wstring FormatScanResults()
+{
+    if (g_lastScanResults.empty())
+    {
+        return L"Результаты сканирования отсутствуют.";
+    }
+
+    std::wstring message;
+    for (const auto& finding : g_lastScanResults)
+    {
+        message += L"Файл: " + finding.matchedPath + L"\r\n";
+        message += L"Тип: " + av::ObjectTypeName(finding.objectType) + L"\r\n";
+        message += L"Смещение: " + std::to_wstring(finding.offset) + L"\r\n";
+        message += L"Сигнатура: " + finding.matchedSignature + L"\r\n\r\n";
+    }
+
+    return message;
+}
+
+void ShowScanResults(HWND owner)
+{
+    MessageBoxW(owner, FormatScanResults().c_str(), L"Результаты сканирования", MB_OK | MB_ICONWARNING);
+}
+
+void ScanSelectedFile(HWND owner)
+{
+    wchar_t fileName[MAX_PATH]{};
+    OPENFILENAMEW ofn{};
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = owner;
+    ofn.lpstrFile = fileName;
+    ofn.nMaxFile = MAX_PATH;
+    ofn.lpstrFilter = L"Executable Files\0*.exe;*.dll;*.sys\0All Files\0*.*\0";
+    ofn.nFilterIndex = 1;
+    ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_HIDEREADONLY;
+
+    if (!GetOpenFileNameW(&ofn))
+    {
+        return;
+    }
+
+    g_lastScanResults.clear();
+    av::ScanFinding finding{};
+    if (av::ScanFile(fileName, g_avDatabase, finding) && finding.infected)
+    {
+        g_lastScanResults.push_back(finding);
+        MessageBoxW(owner, L"Файл признан вредоносным.", L"Сканирование файла", MB_OK | MB_ICONWARNING);
+    }
+    else
+    {
+        MessageBoxW(owner, L"Вредоносные сигнатуры не найдены.", L"Сканирование файла", MB_OK | MB_ICONINFORMATION);
+    }
+}
+
+void ScanSelectedFolder(HWND owner)
+{
+    BROWSEINFOW bi{};
+    bi.hwndOwner = owner;
+    bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
+    bi.lpszTitle = L"Выберите папку для сканирования";
+
+    PIDLIST_ABSOLUTE folder = SHBrowseForFolderW(&bi);
+    if (!folder)
+    {
+        return;
+    }
+
+    wchar_t path[MAX_PATH]{};
+    if (!SHGetPathFromIDListW(folder, path))
+    {
+        CoTaskMemFree(folder);
+        return;
+    }
+
+    CoTaskMemFree(folder);
+
+    g_lastScanResults.clear();
+    std::wstring summary = av::ScanFolder(path, g_avDatabase, g_lastScanResults);
+    MessageBoxW(owner, summary.c_str(), L"Сканирование папки", MB_OK | MB_ICONINFORMATION);
+}
+
+std::wstring ScanAllFixedDrivesInternal()
+{
+    std::wstring summary = L"Сканирование несъёмных дисков:\r\n";
+    const DWORD drives = GetLogicalDrives();
+    int scanned = 0;
+    for (wchar_t letter = L'A'; letter <= L'Z'; ++letter)
+    {
+        const DWORD mask = 1u << (letter - L'A');
+        if ((drives & mask) == 0)
+        {
+            continue;
+        }
+
+        wchar_t root[] = { letter, L':', L'\\', L'\0' };
+        UINT type = GetDriveTypeW(root);
+        if (type != DRIVE_FIXED)
+        {
+            continue;
+        }
+
+        ++scanned;
+        summary += root;
+        summary += L"\r\n";
+        summary += av::ScanFolder(root, g_avDatabase, g_lastScanResults);
+        summary += L"\r\n";
+    }
+
+    if (scanned == 0)
+    {
+        summary += L"Несъёмные диски не найдены.";
+    }
+
+    return summary;
+}
+
+void ScanAllFixedDrives(HWND owner)
+{
+    g_lastScanResults.clear();
+    MessageBoxW(owner, ScanAllFixedDrivesInternal().c_str(), L"Сканирование дисков", MB_OK | MB_ICONINFORMATION);
+}
+
+struct ScheduleDialogState
+{
+    unsigned int minutes = 60;
+    bool accepted = false;
+};
+
+INT_PTR CALLBACK ScheduleDialogProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lParam)
+{
+    switch (message)
+    {
+    case WM_INITDIALOG:
+    {
+        auto* state = reinterpret_cast<ScheduleDialogState*>(lParam);
+        SetWindowLongPtr(hDlg, DWLP_USER, reinterpret_cast<LONG_PTR>(state));
+        if (state)
+        {
+            SetDlgItemInt(hDlg, IDC_SCHEDULE_MINUTES, state->minutes, FALSE);
+            SetDlgItemTextW(hDlg, IDC_SCHEDULE_STATUS, g_scheduleEnabled ? L"включено" : L"выключено");
+        }
+        return (INT_PTR)TRUE;
+    }
+    case WM_COMMAND:
+        if (LOWORD(wParam) == IDOK)
+        {
+            auto* state = reinterpret_cast<ScheduleDialogState*>(GetWindowLongPtr(hDlg, DWLP_USER));
+            if (state)
+            {
+                BOOL translated = FALSE;
+                UINT value = GetDlgItemInt(hDlg, IDC_SCHEDULE_MINUTES, &translated, FALSE);
+                if (translated && value > 0)
+                {
+                    state->minutes = value;
+                    state->accepted = true;
+                }
+            }
+            EndDialog(hDlg, IDOK);
+            return (INT_PTR)TRUE;
+        }
+        if (LOWORD(wParam) == IDCANCEL)
+        {
+            EndDialog(hDlg, IDCANCEL);
+            return (INT_PTR)TRUE;
+        }
+        break;
+    }
+    return (INT_PTR)FALSE;
+}
+
+void ConfigureScheduledScan(HWND owner)
+{
+    ScheduleDialogState state{};
+    state.minutes = g_scheduleIntervalMinutes;
+    DialogBoxParamW(hInst, MAKEINTRESOURCEW(IDD_SCHEDULE_DIALOG), owner, ScheduleDialogProc, reinterpret_cast<LPARAM>(&state));
+    if (!state.accepted)
+    {
+        return;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(g_stateMutex);
+        g_scheduleIntervalMinutes = state.minutes;
+    }
+
+    SetTimer(owner, kScheduleTimerId, g_scheduleIntervalMinutes * 60 * 1000, nullptr);
+    MessageBoxW(owner, L"Расписание сохранено.", L"Расписание", MB_OK | MB_ICONINFORMATION);
+}
+
+void ToggleScheduledScan(HWND owner)
+{
+    g_scheduleEnabled = !g_scheduleEnabled;
+    if (g_scheduleEnabled)
+    {
+        SetTimer(owner, kScheduleTimerId, g_scheduleIntervalMinutes * 60 * 1000, nullptr);
+    }
+    else
+    {
+        KillTimer(owner, kScheduleTimerId);
+    }
+
+    UpdateStatusText(g_scheduleEnabled ? L"Статус: расписание включено" : L"Статус: расписание выключено");
+}
+
+void MonitorDirectoryChanges(HWND owner, const std::wstring& directory)
+{
+    HANDLE stopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!stopEvent)
+    {
+        return;
+    }
+
+    HANDLE thread = CreateThread(nullptr, 0, [](LPVOID param) -> DWORD
+    {
+        std::wstring dir = *reinterpret_cast<std::wstring*>(param);
+        delete reinterpret_cast<std::wstring*>(param);
+
+        HANDLE stop = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        (void)stop;
+        HANDLE change = FindFirstChangeNotificationW(dir.c_str(), FALSE, FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_LAST_WRITE | FILE_NOTIFY_CHANGE_DIR_NAME);
+        if (change == INVALID_HANDLE_VALUE)
+        {
+            return 0;
+        }
+
+        while (WaitForSingleObject(change, 1000) == WAIT_OBJECT_0)
+        {
+            g_lastScanResults.clear();
+            av::ScanFolder(dir, g_avDatabase, g_lastScanResults);
+            FindNextChangeNotification(change);
+        }
+
+        FindCloseChangeNotification(change);
+        return 0;
+    }, new std::wstring(directory), 0, nullptr);
+
+    if (!thread)
+    {
+        CloseHandle(stopEvent);
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(g_stateMutex);
+    g_monitorStopEvents.push_back(stopEvent);
+    g_monitorThreads.push_back(thread);
+    MessageBoxW(owner, L"Мониторинг папки запущен.", L"Мониторинг", MB_OK | MB_ICONINFORMATION);
+}
+
+void AddMonitoringDirectory(HWND owner)
+{
+    BROWSEINFOW bi{};
+    bi.hwndOwner = owner;
+    bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
+    bi.lpszTitle = L"Выберите папку для мониторинга";
+    PIDLIST_ABSOLUTE folder = SHBrowseForFolderW(&bi);
+    if (!folder)
+    {
+        return;
+    }
+
+    wchar_t path[MAX_PATH]{};
+    if (SHGetPathFromIDListW(folder, path))
+    {
+        {
+            std::lock_guard<std::mutex> lock(g_stateMutex);
+            g_monitoredDirectories.emplace_back(path);
+        }
+        MonitorDirectoryChanges(owner, path);
+    }
+    CoTaskMemFree(folder);
+}
+
+void ShowMonitoredDirectories(HWND owner)
+{
+    const auto dirs = GetMonitoredDirectoriesSnapshot();
+    if (dirs.empty())
+    {
+        MessageBoxW(owner, L"Папки мониторинга не настроены.", L"Мониторинг", MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+
+    std::wstring text;
+    for (const auto& dir : dirs)
+    {
+        text += dir + L"\r\n";
+    }
+    MessageBoxW(owner, text.c_str(), L"Папки мониторинга", MB_OK | MB_ICONINFORMATION);
+}
+
+void CenterWindow(HWND hWnd)
+{
+    RECT rect{};
+    if (!GetWindowRect(hWnd, &rect))
+    {
+        return;
+    }
+
+    int width = rect.right - rect.left;
+    int height = rect.bottom - rect.top;
+
+    int screenWidth = GetSystemMetrics(SM_CXSCREEN);
+    int screenHeight = GetSystemMetrics(SM_CYSCREEN);
+
+    int x = (screenWidth - width) / 2;
+    int y = (screenHeight - height) / 2;
+
+    SetWindowPos(hWnd, nullptr, x, y, 0, 0, SWP_NOZORDER | SWP_NOSIZE);
+}
+
+bool EnsureAuthenticated(HWND hWnd, std::wstring& username)
+{
+    bool authenticated = false;
+    std::wstring currentUser;
+    DWORD status = RpcCallGetUserInfo(authenticated, currentUser);
+    if (status == ERROR_SUCCESS && authenticated)
+    {
+        username = currentUser;
+        return true;
+    }
+
+    UpdateStatusText(L"Статус: требуется вход");
+    UpdateUserText(L"-");
+    UpdateLicenseText(L"Лицензия: неизвестно");
+    UpdateExpirationText(L"Срок действия: -");
+
+    while (true)
+    {
+        std::wstring login;
+        std::wstring password;
+        if (!ShowLoginDialog(hWnd, login, password))
+        {
+            return false;
+        }
+
+        DWORD loginStatus = RpcCallLogin(login, password);
+        if (loginStatus == ERROR_SUCCESS)
+        {
+            username = login;
+            return true;
+        }
+
+        MessageBoxW(hWnd, L"Ошибка входа. Проверьте логин и пароль.", L"Вход", MB_OK | MB_ICONERROR);
+    }
+}
+
+bool EnsureLicense(HWND hWnd, const std::wstring& username)
+{
+    UpdateUserText(username);
+    UpdateStatusText(L"Статус: проверка лицензии");
+    UpdateAvStatusText();
+    if (!g_avDatabaseLoaded)
+    {
+        LoadAvDatabase();
+    }
+
+    if (g_avDatabaseLoaded)
+    {
+        UpdateAvStatusText();
+    }
+
+    while (true)
+    {
+        bool hasLicense = false;
+        bool blocked = false;
+        std::wstring expiration;
+        DWORD status = RpcCallGetLicenseInfo(hasLicense, blocked, expiration);
+        if (status == ERROR_SUCCESS && hasLicense && !blocked)
+        {
+            UpdateLicenseText(L"Лицензия: активна");
+            UpdateExpirationText(L"Срок действия: " + expiration);
+            UpdateStatusText(L"Антивирус активен");
+            return true;
+        }
+
+        if (status == ERROR_SUCCESS && hasLicense && blocked)
+        {
+            UpdateLicenseText(L"Лицензия: заблокирована");
+        }
+        else
+        {
+            UpdateLicenseText(L"Лицензия: отсутствует");
+        }
+
+        UpdateExpirationText(L"Срок действия: -");
+        UpdateStatusText(L"Антивирус заблокирован");
+
+        std::wstring activationKey;
+        if (!ShowActivationDialog(hWnd, activationKey))
+        {
+            return false;
+        }
+
+        DWORD activateStatus = RpcCallActivate(activationKey);
+        if (activateStatus == ERROR_SUCCESS)
+        {
+            continue;
+        }
+
+        MessageBoxW(hWnd, L"Ошибка активации. Нужен действительный activationKey из сервера.", L"Активация", MB_OK | MB_ICONERROR);
+    }
+}
+
+void RefreshLicenseStatus(HWND hWnd)
+{
+    if (g_uiFlowRunning)
+    {
+        return;
+    }
+
+    g_uiFlowRunning = true;
+
+    std::wstring username;
+    if (!EnsureAuthenticated(hWnd, username))
+    {
+        g_uiFlowRunning = false;
+        return;
+    }
+
+    EnsureLicense(hWnd, username);
+    g_uiFlowRunning = false;
+}
+
 int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
                      _In_opt_ HINSTANCE hPrevInstance,
                      _In_ LPWSTR    lpCmdLine,
@@ -88,10 +1301,37 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
 {
     UNREFERENCED_PARAMETER(hPrevInstance);
 
+    const bool debugRun = IsDebuggerPresent() != FALSE;
+
+    LogMessage(L"TrayApp starting");
+    if (lpCmdLine)
+    {
+        LogMessage(std::wstring(L"Command line: ") + lpCmdLine);
+    }
+    LogMessage(std::wstring(L"Debug run: ") + (debugRun ? L"true" : L"false"));
+
+    if (!debugRun)
+    {
+        if (!IsParentService())
+        {
+            if (!ServiceMustAllowRun())
+            {
+                LogMessage(L"Service check failed, exiting");
+                return FALSE;
+            }
+
+            LogMessage(L"Parent process is not service, exiting");
+            return FALSE;
+        }
+    }
+
+    ApplyProcessDacl();
+
     const std::wstring mutexName = BuildMutexNamePerUser();
     g_singleInstanceMutex = CreateMutexW(nullptr, FALSE, mutexName.c_str());
     if (!g_singleInstanceMutex || GetLastError() == ERROR_ALREADY_EXISTS)
     {
+        LogMessage(L"Single instance check failed, exiting");
         if (g_singleInstanceMutex)
         {
             CloseHandle(g_singleInstanceMutex);
@@ -99,6 +1339,8 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
         }
         return FALSE;
     }
+
+    LogMessage(L"Instance mutex created");
 
     LoadStringW(hInstance, IDS_APP_TITLE, szTitle, MAX_LOADSTRING);
     LoadStringW(hInstance, IDC_ZIOVPOPZ, szWindowClass, MAX_LOADSTRING);
@@ -111,10 +1353,13 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
 
     if (!InitInstance(hInstance, nCmdShow, startHidden))
     {
+        LogMessage(L"InitInstance failed");
         CloseHandle(g_singleInstanceMutex);
         g_singleInstanceMutex = nullptr;
         return FALSE;
     }
+
+    LogMessage(L"InitInstance ok, entering message loop");
 
     HACCEL hAccelTable = LoadAccelerators(hInstance, MAKEINTRESOURCE(IDC_ZIOVPOPZ));
 
@@ -151,7 +1396,7 @@ ATOM MyRegisterClass(HINSTANCE hInstance)
     wcex.hInstance      = hInstance;
     wcex.hIcon          = LoadIcon(hInstance, MAKEINTRESOURCE(IDI_ZIOVPOPZ));
     wcex.hCursor        = LoadCursor(nullptr, IDC_ARROW);
-    wcex.hbrBackground  = (HBRUSH)(COLOR_WINDOW+1);
+    wcex.hbrBackground  = (HBRUSH)(COLOR_WINDOW + 1);
     wcex.lpszMenuName   = MAKEINTRESOURCEW(IDC_ZIOVPOPZ);
     wcex.lpszClassName  = szWindowClass;
     wcex.hIconSm        = LoadIcon(wcex.hInstance, MAKEINTRESOURCE(IDI_SMALL));
@@ -161,23 +1406,24 @@ ATOM MyRegisterClass(HINSTANCE hInstance)
 
 BOOL InitInstance(HINSTANCE hInstance, int nCmdShow, bool startHidden)
 {
-   hInst = hInstance;
+    hInst = hInstance;
 
-   HWND hWnd = CreateWindowW(szWindowClass, szTitle, WS_OVERLAPPEDWINDOW,
-      CW_USEDEFAULT, 0, CW_USEDEFAULT, 0, nullptr, nullptr, hInstance, nullptr);
+    HWND hWnd = CreateWindowW(szWindowClass, szTitle, WS_OVERLAPPEDWINDOW,
+        CW_USEDEFAULT, 0, CW_USEDEFAULT, 0, nullptr, nullptr, hInstance, nullptr);
 
-   if (!hWnd)
-   {
-      return FALSE;
-   }
+    if (!hWnd)
+    {
+        return FALSE;
+    }
 
-   if (!startHidden)
-   {
-       ShowWindow(hWnd, nCmdShow);
-       UpdateWindow(hWnd);
-   }
+    if (!startHidden)
+    {
+        CenterWindow(hWnd);
+        ShowWindow(hWnd, nCmdShow);
+        UpdateWindow(hWnd);
+    }
 
-   return TRUE;
+    return TRUE;
 }
 
 LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
@@ -192,6 +1438,18 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
     {
     case WM_CREATE:
         AddTrayIcon(hWnd);
+        g_statusText = CreateWindowW(L"STATIC", L"Статус: -", WS_CHILD | WS_VISIBLE,
+                    10, 10, 520, 20, hWnd, reinterpret_cast<HMENU>(IDC_STATUS_TEXT), hInst, nullptr);
+                g_userText = CreateWindowW(L"STATIC", L"Пользователь: -", WS_CHILD | WS_VISIBLE,
+                    10, 35, 520, 20, hWnd, reinterpret_cast<HMENU>(IDC_USER_TEXT), hInst, nullptr);
+                g_licenseText = CreateWindowW(L"STATIC", L"Лицензия: -", WS_CHILD | WS_VISIBLE,
+                    10, 60, 520, 20, hWnd, reinterpret_cast<HMENU>(IDC_LICENSE_TEXT), hInst, nullptr);
+                g_expirationText = CreateWindowW(L"STATIC", L"Срок действия: -", WS_CHILD | WS_VISIBLE,
+                    10, 85, 520, 20, hWnd, reinterpret_cast<HMENU>(IDC_EXPIRATION_TEXT), hInst, nullptr);
+                g_avStatusText = CreateWindowW(L"STATIC", L"Антивирусные базы: -", WS_CHILD | WS_VISIBLE,
+                    10, 110, 520, 20, hWnd, reinterpret_cast<HMENU>(IDC_AV_STATUS_TEXT), hInst, nullptr);
+                SetTimer(hWnd, 1, 30000, nullptr);
+                PostMessageW(hWnd, WM_APP_STARTUP, 0, 0);
         break;
     case WM_CLOSE:
         if (!g_isExiting)
@@ -201,25 +1459,72 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
         }
         break;
     case WM_COMMAND:
+    {
+        int wmId = LOWORD(wParam);
+        switch (wmId)
         {
-            int wmId = LOWORD(wParam);
-            switch (wmId)
-            {
-            case IDM_ABOUT:
-                DialogBox(hInst, MAKEINTRESOURCE(IDD_ABOUTBOX), hWnd, About);
-                break;
-            case IDM_EXIT:
-            case IDM_TRAY_EXIT:
-                g_isExiting = true;
-                DestroyWindow(hWnd);
-                break;
-            case IDM_TRAY_OPEN:
-                ShowMainWindow(hWnd);
-                break;
-            default:
-                return DefWindowProc(hWnd, message, wParam, lParam);
-            }
+        case IDM_ABOUT:
+            DialogBox(hInst, MAKEINTRESOURCE(IDD_ABOUTBOX), hWnd, About);
+            break;
+        case IDM_EXIT:
+        case IDM_TRAY_EXIT:
+            g_isExiting = true;
+            StopServiceByRpc();
+            DestroyWindow(hWnd);
+            break;
+        case IDM_LOGOUT:
+            RpcCallLogout();
+            PostMessageW(hWnd, WM_APP_STARTUP, 0, 0);
+            break;
+        case IDM_SCAN_FILE:
+            ScanSelectedFile(hWnd);
+            break;
+        case IDM_SCAN_FOLDER:
+            ScanSelectedFolder(hWnd);
+            break;
+        case IDM_SCAN_RESULTS:
+            ShowScanResults(hWnd);
+            break;
+        case IDM_SCAN_ALL_DRIVES:
+            ScanAllFixedDrives(hWnd);
+            break;
+        case IDM_SCHEDULE_SCAN:
+            ToggleScheduledScan(hWnd);
+            break;
+        case IDM_SCHEDULE_SETTINGS:
+            ConfigureScheduledScan(hWnd);
+            break;
+        case IDM_MONITOR_ADD:
+            AddMonitoringDirectory(hWnd);
+            break;
+        case IDM_MONITOR_LIST:
+            ShowMonitoredDirectories(hWnd);
+            break;
+        case IDM_TRAY_OPEN:
+            ShowMainWindow(hWnd);
+            break;
+        default:
+            return DefWindowProc(hWnd, message, wParam, lParam);
         }
+    }
+    break;
+    case WM_TIMER:
+        if (wParam == 1)
+        {
+            RefreshLicenseStatus(hWnd);
+        }
+        else if (wParam == kScheduleTimerId && g_scheduleEnabled)
+        {
+            ScanAllFixedDrives(hWnd);
+        }
+        break;
+    case WM_APP_STARTUP:
+        RefreshLicenseStatus(hWnd);
+        if (!g_avDatabaseLoaded)
+        {
+            LoadAvDatabase();
+        }
+        UpdateAvStatusText();
         break;
     case WM_TRAYICON:
         switch (LOWORD(lParam))
@@ -236,14 +1541,38 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
         }
         return 0;
     case WM_PAINT:
-        {
-            PAINTSTRUCT ps;
-            HDC hdc = BeginPaint(hWnd, &ps);
-            EndPaint(hWnd, &ps);
-        }
-        break;
+    {
+        PAINTSTRUCT ps;
+        HDC hdc = BeginPaint(hWnd, &ps);
+        UNREFERENCED_PARAMETER(hdc);
+        EndPaint(hWnd, &ps);
+    }
+    break;
     case WM_DESTROY:
         RemoveTrayIcon();
+        KillTimer(hWnd, 1);
+        KillTimer(hWnd, kScheduleTimerId);
+        {
+            std::lock_guard<std::mutex> lock(g_stateMutex);
+            for (HANDLE h : g_monitorStopEvents)
+            {
+                if (h)
+                {
+                    SetEvent(h);
+                    CloseHandle(h);
+                }
+            }
+            for (HANDLE h : g_monitorThreads)
+            {
+                if (h)
+                {
+                    WaitForSingleObject(h, 1000);
+                    CloseHandle(h);
+                }
+            }
+            g_monitorStopEvents.clear();
+            g_monitorThreads.clear();
+        }
         PostQuitMessage(0);
         break;
     default:
