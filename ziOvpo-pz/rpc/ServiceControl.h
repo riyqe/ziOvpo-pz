@@ -86,6 +86,18 @@ long RpcActivate(
     /* [in] */ handle_t hBinding,
     /* [string][in] */ const wchar_t *activationKey);
 
+long RpcGetAvDatabaseInfo( 
+    /* [in] */ handle_t hBinding,
+    /* [out] */ long *isLoaded,
+    /* [string][out] */ wchar_t **releaseDate,
+    /* [out] */ long *recordCount);
+
+long RpcScanPath( 
+    /* [in] */ handle_t hBinding,
+    /* [string][in] */ const wchar_t *path,
+    /* [in] */ long isFolder,
+    /* [out] */ long *infected,
+    /* [string][out] */ wchar_t **summary);
 
 
 extern RPC_IF_HANDLE ServiceControl_v1_0_c_ifspec;
