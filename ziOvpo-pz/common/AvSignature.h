@@ -3,6 +3,7 @@
 #include <windows.h>
 #include <wincrypt.h>
 
+#include <algorithm>
 #include <filesystem>
 #include <fstream>
 #include <string>
@@ -155,7 +156,7 @@ namespace avstore
 				return false;
 			}
 
-			HCRYPTHASH hash = nullptr;
+			HCRYPTHASH hash = 0;
 			if (!CryptCreateHash(m_prov, CALG_SHA_256, 0, 0, &hash))
 			{
 				return false;
@@ -202,135 +203,6 @@ namespace avstore
 
 		HCRYPTPROV m_prov = 0;
 		HCRYPTKEY m_key = 0;
-		bool m_ready = false;
-	};
-
-	class SignatureSigner
-	{
-	public:
-		bool InitializeFromPfx(const std::filesystem::path& pfxPath, const std::wstring& password)
-		{
-			Release();
-
-			std::ifstream input(pfxPath, std::ios::binary);
-			if (!input)
-			{
-				return false;
-			}
-
-			std::vector<BYTE> pfx((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
-			CRYPT_DATA_BLOB blob{};
-			blob.cbData = static_cast<DWORD>(pfx.size());
-			blob.pbData = pfx.data();
-
-			if (!PFXIsPFXBlob(&blob))
-			{
-				return false;
-			}
-
-			if (!PFXVerifyPassword(&blob, password.c_str(), 0))
-			{
-				return false;
-			}
-
-			if (!PFXImportCertStore(&blob, password.c_str(), CRYPT_EXPORTABLE, &m_store))
-			{
-				return false;
-			}
-
-			PCCERT_CONTEXT cert = CertFindCertificateInStore(m_store, X509_ASN_ENCODING | PKCS_7_ASN_ENCODING, 0, CERT_FIND_ANY, nullptr, nullptr);
-			if (!cert)
-			{
-				Release();
-				return false;
-			}
-
-			if (!CryptAcquireCertificatePrivateKey(cert, 0, nullptr, &m_key, nullptr, nullptr))
-			{
-				CertFreeCertificateContext(cert);
-				Release();
-				return false;
-			}
-
-			if (!CryptAcquireContextW(&m_prov, nullptr, nullptr, PROV_RSA_AES, CRYPT_VERIFYCONTEXT))
-			{
-				CertFreeCertificateContext(cert);
-				Release();
-				return false;
-			}
-
-			CertFreeCertificateContext(cert);
-			m_ready = true;
-			return true;
-		}
-
-		bool Sign(const std::vector<BYTE>& data, std::vector<BYTE>& signature) const
-		{
-			if (!m_ready)
-			{
-				return false;
-			}
-
-			HCRYPTHASH hash = nullptr;
-			if (!CryptCreateHash(m_prov, CALG_SHA_256, 0, 0, &hash))
-			{
-				return false;
-			}
-
-			if (!CryptHashData(hash, data.data(), static_cast<DWORD>(data.size()), 0))
-			{
-				CryptDestroyHash(hash);
-				return false;
-			}
-
-			DWORD sigLen = 0;
-			if (!CryptSignHashW(hash, AT_SIGNATURE, nullptr, 0, nullptr, &sigLen))
-			{
-				CryptDestroyHash(hash);
-				return false;
-			}
-
-			signature.resize(sigLen);
-			if (!CryptSignHashW(hash, AT_SIGNATURE, nullptr, 0, signature.data(), &sigLen))
-			{
-				CryptDestroyHash(hash);
-				return false;
-			}
-
-			signature.resize(sigLen);
-			CryptDestroyHash(hash);
-			return true;
-		}
-
-		~SignatureSigner()
-		{
-			Release();
-		}
-
-	private:
-		void Release()
-		{
-			if (m_key)
-			{
-				CryptDestroyKey(m_key);
-				m_key = 0;
-			}
-			if (m_store)
-			{
-				CertCloseStore(m_store, 0);
-				m_store = nullptr;
-			}
-			if (m_prov)
-			{
-				CryptReleaseContext(m_prov, 0);
-				m_prov = 0;
-			}
-			m_ready = false;
-		}
-
-		HCRYPTPROV m_prov = 0;
-		HCRYPTKEY m_key = 0;
-		HCERTSTORE m_store = nullptr;
 		bool m_ready = false;
 	};
 }
