@@ -16,7 +16,7 @@ jobs:
       - name: Build
         run: cmake --build build --config Release
 
-      - name: Pack
+      - name: Stage application files
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path out/data | Out-Null
@@ -25,7 +25,37 @@ jobs:
           Copy-Item build/Release/data/default.avdb out/data/
           Copy-Item build/Release/data/public_cert.pem out/data/
 
+      - name: Download MSVC Redistributable (x64)
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path installer/third_party | Out-Null
+          Invoke-WebRequest `
+            -Uri 'https://aka.ms/vs/17/release/vc_redist.x64.exe' `
+            -OutFile 'installer/third_party/vc_redist.x64.exe' `
+            -UseBasicParsing
+
+      - name: Install Inno Setup 6
+        shell: pwsh
+        run: |
+          $uri = 'https://jrsoftware.org/download.php/is.exe?site=2'
+          Invoke-WebRequest -Uri $uri -OutFile InnoSetupInstaller.exe -UseBasicParsing
+          Start-Process -FilePath .\InnoSetupInstaller.exe -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART' -Wait
+          Remove-Item -Force InnoSetupInstaller.exe
+
+      - name: Build Inno installer
+        shell: pwsh
+        env:
+          ISCC_VER: '${{ github.run_number }}.0.0'
+        run: |
+          $iscc = 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe'
+          if (-not (Test-Path $iscc)) {
+            throw "ISCC.exe not found at $iscc"
+          }
+          & $iscc /DSrcDir=..\out /DMyVersion=$env:ISCC_VER (Join-Path (Get-Location) 'installer\ZiOvpoPzInstaller.iss')
+
       - uses: actions/upload-artifact@v4
         with:
           name: release
-          path: out/
+          path: |
+            dist/
+            out/

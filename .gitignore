@@ -1,4 +1,6 @@
 .DS_Store
 build/
+dist/
 tools/.venv/
 tools/__pycache__/
+installer/third_party/*.exe
