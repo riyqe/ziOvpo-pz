@@ -28,7 +28,6 @@ try {
     $null = & sc.exe delete $ServiceName 2>&1
     Start-Sleep -Milliseconds 800
 
-    # Путь с пробелами — в SCM нужны кавычки вокруг полного пути
     $binPath = "`"$exe`""
     New-Service -Name $ServiceName -BinaryPathName $binPath -DisplayName $DisplayName -StartupType Automatic
     Set-Service -Name $ServiceName -Description "ZiOvpo PZ background antivirus service."
