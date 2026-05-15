@@ -1,39 +1,4 @@
-# Build directories
-/build/
-/build-*/
-/out/
-/artifact/
-
-# CMake
-/CMakeFiles/
-/CMakeCache.txt
-/cmake_install.cmake
-/compile_commands.json
-/CTestTestfile.cmake
-/Testing/
-
-# Ninja
-/.ninja_deps
-/.ninja_log
-/build.ninja
-
-# Visual Studio
-/.vs/
-*.VC.db
-*.VC.opendb
-*.suo
-*.user
-*.userosscache
-*.sln.docstates
-
-# Binaries
-*.exe
-*.dll
-*.pdb
-*.ilk
-*.obj
-*.lib
-*.exp
-
-# Logs
-*.log
+.DS_Store
+build/
+tools/.venv/
+tools/__pycache__/
