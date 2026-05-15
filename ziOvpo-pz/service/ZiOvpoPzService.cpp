@@ -1433,6 +1433,7 @@ bool StartAppInSession(DWORD sessionId)
 
     std::wstring appPath = GetTrayAppPath();
     std::wstring command = L"\"" + appPath + L"\" --hidden";
+    std::wstring workDir = GetSelfDirectory();
 
     STARTUPINFOW si{};
     si.cb = sizeof(si);
@@ -1450,7 +1451,7 @@ bool StartAppInSession(DWORD sessionId)
         FALSE,
         CREATE_UNICODE_ENVIRONMENT,
         env,
-        nullptr,
+        workDir.c_str(),
         &si,
         &pi);
 
@@ -1524,6 +1525,11 @@ void StartAppsInCurrentSessions()
     {
         DWORD id = sessions[i].SessionId;
         if (id == 0)
+        {
+            continue;
+        }
+
+        if (sessions[i].State != WTSActive && sessions[i].State != WTSConnected)
         {
             continue;
         }

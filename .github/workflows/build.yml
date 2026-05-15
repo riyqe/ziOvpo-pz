@@ -10,20 +10,24 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Configure
-        run: cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Configure (Ninja)
+        run: cmake --preset ninja-release
 
       - name: Build
-        run: cmake --build build --config Release
+        run: cmake --build --preset ninja-release
 
       - name: Stage application files
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path out/data | Out-Null
-          Copy-Item build/Release/TrayApp.exe out/
-          Copy-Item build/Release/ZiOvpoPzService.exe out/
-          Copy-Item build/Release/data/default.avdb out/data/
-          Copy-Item build/Release/data/public_cert.pem out/data/
+          Copy-Item build/TrayApp.exe out/
+          Copy-Item build/ZiOvpoPzService.exe out/
+          Copy-Item build/data/default.avdb out/data/
+          Copy-Item build/data/public_cert.pem out/data/
 
       - name: Download MSVC Redistributable (x64)
         shell: pwsh

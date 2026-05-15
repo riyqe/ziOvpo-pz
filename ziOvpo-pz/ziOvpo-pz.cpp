@@ -553,8 +553,7 @@ bool ServiceMustAllowRun()
         else
         {
             StartServiceW(service, 0, nullptr);
-            WaitServiceRunning(service);
-            allowRun = false;
+            allowRun = WaitServiceRunning(service);
         }
     }
 
@@ -1327,8 +1326,7 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
                 return FALSE;
             }
 
-            LogMessage(L"Parent process is not service, exiting");
-            return FALSE;
+            LogMessage(L"Manual TrayApp start allowed (service is running)");
         }
     }
 
@@ -1534,9 +1532,12 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
         UpdateAvStatusText();
         break;
     case WM_TRAYICON:
-        switch (LOWORD(lParam))
+        // При NOTIFYICON_VERSION=4 одиночный левый клик приходит как NIN_SELECT, а не WM_LBUTTON*.
+        switch (static_cast<UINT>(lParam))
         {
         case WM_LBUTTONUP:
+        case WM_LBUTTONDBLCLK:
+        case NIN_SELECT:
             ShowMainWindow(hWnd);
             break;
         case WM_RBUTTONUP:

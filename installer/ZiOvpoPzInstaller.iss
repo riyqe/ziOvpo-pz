@@ -23,6 +23,10 @@ AppPublisher={#MyAppPublisher}
 DefaultDirName={autopf}\ZiOvpoPz
 DefaultGroupName={#MyAppDisplayName}
 DisableProgramGroupPage=yes
+; Явно включаем запись в «Приложения и возможности» / Программы и компоненты и деинсталлятор
+Uninstallable=yes
+CreateUninstallRegKey=yes
+UninstallDisplayName={#MyAppDisplayName}
 OutputDir=..\dist
 OutputBaseFilename=ZiOvpoPz-Setup_{#MyVersion}
 ArchitecturesAllowed=x64compatible
@@ -32,6 +36,7 @@ MinVersion=10.0.17763
 UninstallDisplayIcon={app}\TrayApp.exe
 Compression=lzma2
 SolidCompression=yes
+WizardStyle=modern
 
 [Languages]
 Name: "russian"; MessagesFile: "compiler:Languages\Russian.isl"
@@ -46,13 +51,9 @@ Source: "third_party\vc_redist.x64.exe"; Flags: dontcopy
 
 [Icons]
 Name: "{group}\{#MyAppDisplayName}"; Filename: "{app}\TrayApp.exe"
+Name: "{group}\{cm:UninstallProgram,{#MyAppDisplayName}}"; Filename: "{uninstallexe}"
 
 [Code]
-
-function VCRuntimeDetected: Boolean;
-begin
-  Result := RegKeyExists(HKLM64, 'SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\x64');
-end;
 
 procedure StopAndRemoveService;
 var RC: Integer;
@@ -65,16 +66,23 @@ procedure InstallVcRedistributableSilent;
 var
   TmpExe: string;
   RC: Integer;
+  HadRuntime: Boolean;
 begin
+  HadRuntime :=
+    RegKeyExists(HKLM64, 'SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\x64');
+
   ExtractTemporaryFile('vc_redist.x64.exe');
   TmpExe := ExpandConstant('{tmp}\vc_redist.x64.exe');
-
-  if VCRuntimeDetected then
+  if not FileExists(TmpExe) then
+  begin
+    Log('vc_redist.x64.exe not found after extract');
     Exit;
+  end;
 
+  { Всегда запускаем официальный установщик: при уже установленном рантайме это быстрый repair/reconcile }
   if Exec(TmpExe, '/install /quiet /norestart', '', SW_HIDE, ewWaitUntilTerminated, RC) then
   begin
-    if (RC = 0) or (RC = 3010) then
+    if (not HadRuntime) and ((RC = 0) or (RC = 3010)) then
       RegWriteDWordValue(HKLM64, 'SOFTWARE\ZiOvpoPzInstaller', 'ShouldRemoveVcRedist', 1);
   end;
 end;
