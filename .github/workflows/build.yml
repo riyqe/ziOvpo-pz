@@ -10,20 +10,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Generate RPC stubs
-        shell: cmd
-        working-directory: ziOvpo-pz/rpc
-        run: |
-          midl /nologo /win64 ServiceControl.idl
-          move /Y ServiceControl_c.c ServiceControl_c_x64.c
-          move /Y ServiceControl_s.c ServiceControl_s_x64.c
-          midl /nologo /win32 ServiceControl.idl
-          move /Y ServiceControl_c.c ServiceControl_c_win32.c
-          move /Y ServiceControl_s.c ServiceControl_s_win32.c
-          midl /nologo /arm64 ServiceControl.idl
-          move /Y ServiceControl_c.c ServiceControl_c_arm64.c
-          move /Y ServiceControl_s.c ServiceControl_s_arm64.c
-
       - name: Configure
         run: cmake -S . -B build -G "Visual Studio 17 2022" -A x64
 
