@@ -3,6 +3,33 @@
 #include "resource.h"
 #include <shellapi.h>
 #include <string>
+#include <vector>
+
+namespace av
+{
+    struct AvDatabase;
+    struct ScanFinding;
+}
+
+extern av::AvDatabase g_avDatabase;
+extern std::vector<av::ScanFinding> g_lastScanResults;
+extern bool g_avDatabaseLoaded;
+
+extern bool g_scheduleEnabled;
+extern unsigned int g_scheduleIntervalMinutes;
+extern std::vector<std::wstring> g_monitoredDirectories;
+
+void LoadAvDatabase();
+void UpdateAvStatusText();
+void ScanSelectedFile(HWND owner);
+void ScanSelectedFolder(HWND owner);
+void ScanAllFixedDrives(HWND owner);
+void ConfigureScheduledScan(HWND owner);
+void ToggleScheduledScan(HWND owner);
+void AddMonitoringDirectory(HWND owner);
+void ShowMonitoredDirectories(HWND owner);
+void ShowScanResults(HWND owner);
+
 
 #define MAX_LOADSTRING 100
 
