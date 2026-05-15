@@ -51,7 +51,6 @@ bool g_uiFlowRunning = false;
 bool g_avDatabaseLoaded = false;
 bool g_scheduleEnabled = false;
 unsigned int g_scheduleIntervalMinutes = 60;
-av::AvDatabase g_avDatabase{};
 std::vector<av::ScanFinding> g_lastScanResults;
 std::vector<std::wstring> g_monitoredDirectories;
 std::vector<HANDLE> g_monitorStopEvents;
@@ -280,75 +279,78 @@ DWORD RpcCallActivate(const std::wstring& activationKey)
     return status;
 }
 
-long RpcGetAvDatabaseInfo(handle_t, long* isLoaded, wchar_t** releaseDate, long* recordCount)
+DWORD RpcCallGetAvDatabaseInfo(long& isLoaded, std::wstring& releaseDate, long& recordCount)
 {
-    if (!isLoaded || !releaseDate || !recordCount)
+    handle_t binding = nullptr;
+    if (!CreateRpcBinding(binding))
     {
-        return ERROR_INVALID_PARAMETER;
+        return ERROR_GEN_FAILURE;
     }
 
-    *isLoaded = g_avDatabaseLoaded ? 1 : 0;
-    const std::size_t count = [&]()
-    {
-        std::size_t total = 0;
-        for (const auto& [_, records] : g_avDatabase.records)
-        {
-            total += records.size();
-        }
-        return total;
-    }();
-    *recordCount = static_cast<long>(count);
+    long loaded = 0;
+    wchar_t* dateText = nullptr;
+    long count = 0;
+    long status = ERROR_GEN_FAILURE;
 
-    const std::wstring text = g_avDatabaseLoaded ? av::FormatReleaseDate(g_avDatabase.releaseDate) : L"-";
-    *releaseDate = reinterpret_cast<wchar_t*>(MIDL_user_allocate((text.size() + 1) * sizeof(wchar_t)));
-    if (!*releaseDate)
+    RpcTryExcept
     {
-        return ERROR_OUTOFMEMORY;
+        status = RpcGetAvDatabaseInfo(binding, &loaded, &dateText, &count);
+    }
+    RpcExcept(1)
+    {
+        status = ERROR_GEN_FAILURE;
+    }
+    RpcEndExcept;
+
+    if (status == ERROR_SUCCESS)
+    {
+        isLoaded = loaded;
+        recordCount = count;
+        releaseDate = dateText ? dateText : L"-";
     }
 
-    wcscpy_s(*releaseDate, text.size() + 1, text.c_str());
-    return ERROR_SUCCESS;
+    if (dateText)
+    {
+        MIDL_user_free(dateText);
+    }
+
+    FreeRpcBinding(binding);
+    return status;
 }
 
-long RpcScanPath(handle_t, const wchar_t* path, long isFolder, long* infected, wchar_t** summary)
+DWORD RpcCallScanPath(const std::wstring& path, bool isFolder, long& infected, std::wstring& summary)
 {
-    if (!path || !infected || !summary)
+    handle_t binding = nullptr;
+    if (!CreateRpcBinding(binding))
     {
-        return ERROR_INVALID_PARAMETER;
+        return ERROR_GEN_FAILURE;
     }
 
-    *infected = 0;
-    g_lastScanResults.clear();
-    std::wstring text;
+    wchar_t* summaryText = nullptr;
+    long status = ERROR_GEN_FAILURE;
 
-    if (isFolder != 0)
+    RpcTryExcept
     {
-        text = av::ScanFolder(path, g_avDatabase, g_lastScanResults);
-        *infected = g_lastScanResults.empty() ? 0 : 1;
+        status = RpcScanPath(binding, path.c_str(), isFolder ? 1 : 0, &infected, &summaryText);
     }
-    else
+    RpcExcept(1)
     {
-        av::ScanFinding finding{};
-        if (av::ScanFile(path, g_avDatabase, finding) && finding.infected)
-        {
-            g_lastScanResults.push_back(finding);
-            *infected = 1;
-            text = L"Файл признан вредоносным.";
-        }
-        else
-        {
-            text = L"Вредоносные сигнатуры не найдены.";
-        }
+        status = ERROR_GEN_FAILURE;
+    }
+    RpcEndExcept;
+
+    if (status == ERROR_SUCCESS && summaryText)
+    {
+        summary = summaryText;
     }
 
-    *summary = reinterpret_cast<wchar_t*>(MIDL_user_allocate((text.size() + 1) * sizeof(wchar_t)));
-    if (!*summary)
+    if (summaryText)
     {
-        return ERROR_OUTOFMEMORY;
+        MIDL_user_free(summaryText);
     }
 
-    wcscpy_s(*summary, text.size() + 1, text.c_str());
-    return ERROR_SUCCESS;
+    FreeRpcBinding(binding);
+    return status;
 }
 
 extern "C" void* __RPC_USER MIDL_user_allocate(size_t size)
@@ -840,29 +842,22 @@ void UpdateAvStatusText(const std::wstring& text)
 
 void UpdateAvStatusText()
 {
-    if (!g_avDatabaseLoaded)
+    long isLoaded = 0;
+    long recordCount = 0;
+    std::wstring releaseDate;
+    if (RpcCallGetAvDatabaseInfo(isLoaded, releaseDate, recordCount) != ERROR_SUCCESS || isLoaded == 0)
     {
+        g_avDatabaseLoaded = false;
         UpdateAvStatusText(L"Антивирусные базы: не загружены");
         return;
     }
 
-    const std::size_t recordCount = [&]()
-    {
-        std::size_t count = 0;
-        for (const auto& [_, records] : g_avDatabase.records)
-        {
-            count += records.size();
-        }
-        return count;
-    }();
-
-    UpdateAvStatusText(L"Антивирусные базы: " + av::FormatReleaseDate(g_avDatabase.releaseDate) + L", записей: " + std::to_wstring(recordCount));
+    g_avDatabaseLoaded = true;
+    UpdateAvStatusText(L"Антивирусные базы: " + releaseDate + L", записей: " + std::to_wstring(recordCount));
 }
 
 void LoadAvDatabase()
 {
-    g_avDatabase = av::CreateDefaultDatabase();
-    g_avDatabaseLoaded = true;
     UpdateAvStatusText();
 }
 
@@ -913,17 +908,15 @@ void ScanSelectedFile(HWND owner)
         return;
     }
 
-    g_lastScanResults.clear();
-    av::ScanFinding finding{};
-    if (av::ScanFile(fileName, g_avDatabase, finding) && finding.infected)
+    long infected = 0;
+    std::wstring summary;
+    if (RpcCallScanPath(fileName, false, infected, summary) != ERROR_SUCCESS)
     {
-        g_lastScanResults.push_back(finding);
-        MessageBoxW(owner, L"Файл признан вредоносным.", L"Сканирование файла", MB_OK | MB_ICONWARNING);
+        MessageBoxW(owner, L"Не удалось выполнить сканирование через службу.", L"Сканирование файла", MB_OK | MB_ICONERROR);
+        return;
     }
-    else
-    {
-        MessageBoxW(owner, L"Вредоносные сигнатуры не найдены.", L"Сканирование файла", MB_OK | MB_ICONINFORMATION);
-    }
+
+    MessageBoxW(owner, summary.c_str(), infected != 0 ? L"Сканирование файла" : L"Сканирование файла", infected != 0 ? MB_OK | MB_ICONWARNING : MB_OK | MB_ICONINFORMATION);
 }
 
 void ScanSelectedFolder(HWND owner)
@@ -949,8 +942,15 @@ void ScanSelectedFolder(HWND owner)
     CoTaskMemFree(folder);
 
     g_lastScanResults.clear();
-    std::wstring summary = av::ScanFolder(path, g_avDatabase, g_lastScanResults);
-    MessageBoxW(owner, summary.c_str(), L"Сканирование папки", MB_OK | MB_ICONINFORMATION);
+    long infected = 0;
+    std::wstring summary;
+    if (RpcCallScanPath(path, true, infected, summary) != ERROR_SUCCESS)
+    {
+        MessageBoxW(owner, L"Не удалось выполнить сканирование через службу.", L"Сканирование папки", MB_OK | MB_ICONERROR);
+        return;
+    }
+
+    MessageBoxW(owner, summary.c_str(), L"Сканирование папки", infected != 0 ? MB_OK | MB_ICONWARNING : MB_OK | MB_ICONINFORMATION);
 }
 
 std::wstring ScanAllFixedDrivesInternal()
@@ -976,7 +976,12 @@ std::wstring ScanAllFixedDrivesInternal()
         ++scanned;
         summary += root;
         summary += L"\r\n";
-        summary += av::ScanFolder(root, g_avDatabase, g_lastScanResults);
+        long infected = 0;
+        std::wstring part;
+        if (RpcCallScanPath(root, true, infected, part) == ERROR_SUCCESS)
+        {
+            summary += part + L"\r\n";
+        }
         summary += L"\r\n";
     }
 
@@ -1100,7 +1105,9 @@ void MonitorDirectoryChanges(HWND owner, const std::wstring& directory)
         while (WaitForSingleObject(change, 1000) == WAIT_OBJECT_0)
         {
             g_lastScanResults.clear();
-            av::ScanFolder(dir, g_avDatabase, g_lastScanResults);
+            long infected = 0;
+            std::wstring summary;
+            RpcCallScanPath(dir, true, infected, summary);
             FindNextChangeNotification(change);
         }
 

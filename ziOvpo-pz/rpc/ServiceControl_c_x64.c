@@ -33,7 +33,7 @@
 #include "ServiceControl.h"
 
 #define TYPE_FORMAT_STRING_SIZE   19                                
-#define PROC_FORMAT_STRING_SIZE   259                               
+#define PROC_FORMAT_STRING_SIZE   391                               
 #define EXPR_FORMAT_STRING_SIZE   1                                 
 #define TRANSMIT_AS_TABLE_SIZE    0            
 #define WIRE_MARSHAL_TABLE_SIZE   0            
@@ -250,6 +250,50 @@ long RpcActivate(
                   (PFORMAT_STRING) &ServiceControl__MIDL_ProcFormatString.Format[216],
                   hBinding,
                   activationKey);
+    return ( long  )_RetVal.Simple;
+    
+}
+
+
+long RpcGetAvDatabaseInfo( 
+    /* [in] */ handle_t hBinding,
+    /* [out] */ long *isLoaded,
+    /* [string][out] */ wchar_t **releaseDate,
+    /* [out] */ long *recordCount)
+{
+
+    CLIENT_CALL_RETURN _RetVal;
+
+    _RetVal = NdrClientCall2(
+                  ( PMIDL_STUB_DESC  )&ServiceControl_StubDesc,
+                  (PFORMAT_STRING) &ServiceControl__MIDL_ProcFormatString.Format[258],
+                  hBinding,
+                  isLoaded,
+                  releaseDate,
+                  recordCount);
+    return ( long  )_RetVal.Simple;
+    
+}
+
+
+long RpcScanPath( 
+    /* [in] */ handle_t hBinding,
+    /* [string][in] */ const wchar_t *path,
+    /* [in] */ long isFolder,
+    /* [out] */ long *infected,
+    /* [string][out] */ wchar_t **summary)
+{
+
+    CLIENT_CALL_RETURN _RetVal;
+
+    _RetVal = NdrClientCall2(
+                  ( PMIDL_STUB_DESC  )&ServiceControl_StubDesc,
+                  (PFORMAT_STRING) &ServiceControl__MIDL_ProcFormatString.Format[312],
+                  hBinding,
+                  path,
+                  isFolder,
+                  infected,
+                  summary);
     return ( long  )_RetVal.Simple;
     
 }
@@ -476,6 +520,90 @@ static const ServiceControl_MIDL_PROC_FORMAT_STRING ServiceControl__MIDL_ProcFor
 /* 256 */	0x8,		/* FC_LONG */
 			0x0,		/* 0 */
 
+	/* Procedure RpcGetAvDatabaseInfo */
+
+/* 258 */	0x0,		/* 0 */
+			0x48,		/* Old Flags:  */
+/* 260 */	NdrFcLong( 0x0 ),	/* 0 */
+/* 264 */	NdrFcShort( 0x6 ),	/* 6 */
+/* 266 */	NdrFcShort( 0x28 ),	/* X64 Stack size/offset = 40 */
+/* 268 */	0x32,		/* FC_BIND_PRIMITIVE */
+			0x0,		/* 0 */
+/* 270 */	NdrFcShort( 0x0 ),	/* X64 Stack size/offset = 0 */
+/* 272 */	NdrFcShort( 0x0 ),	/* 0 */
+/* 274 */	NdrFcShort( 0x40 ),	/* 64 */
+/* 276 */	0x45,		/* Oi2 Flags:  srv must size, has return, has ext, */
+			0x4,		/* 4 */
+/* 278 */	0xa,		/* 10 */
+			0x1,		/* Ext Flags:  new corr desc, */
+/* 280 */	NdrFcShort( 0x0 ),	/* 0 */
+/* 282 */	NdrFcShort( 0x0 ),	/* 0 */
+/* 284 */	NdrFcShort( 0x0 ),	/* 0 */
+/* 286 */	NdrFcShort( 0x0 ),	/* 0 */
+
+/* 288 */	NdrFcShort( 0x2150 ),
+/* 290 */	NdrFcShort( 0x8 ),
+/* 292 */	0x8,
+			0x0,
+
+/* 294 */	NdrFcShort( 0x2013 ),
+/* 296 */	NdrFcShort( 0x10 ),
+/* 298 */	NdrFcShort( 0x6 ),
+
+/* 300 */	NdrFcShort( 0x2150 ),
+/* 302 */	NdrFcShort( 0x18 ),
+/* 304 */	0x8,
+			0x0,
+
+/* 306 */	NdrFcShort( 0x70 ),
+/* 308 */	NdrFcShort( 0x20 ),
+/* 310 */	0x8,
+			0x0,
+
+	/* Procedure RpcScanPath */
+
+/* 312 */	0x0,		/* 0 */
+			0x48,		/* Old Flags:  */
+/* 314 */	NdrFcLong( 0x0 ),	/* 0 */
+/* 318 */	NdrFcShort( 0x7 ),	/* 7 */
+/* 320 */	NdrFcShort( 0x30 ),	/* X64 Stack size/offset = 48 */
+/* 322 */	0x32,		/* FC_BIND_PRIMITIVE */
+			0x0,		/* 0 */
+/* 324 */	NdrFcShort( 0x0 ),	/* X64 Stack size/offset = 0 */
+/* 326 */	NdrFcShort( 0x0 ),	/* 0 */
+/* 328 */	NdrFcShort( 0x58 ),	/* 88 */
+/* 330 */	0x46,		/* Oi2 Flags:  clt must size, has return, has ext, */
+			0x4,		/* 4 */
+/* 332 */	0xa,		/* 10 */
+			0x1,		/* Ext Flags:  new corr desc, */
+/* 334 */	NdrFcShort( 0x0 ),	/* 0 */
+/* 336 */	NdrFcShort( 0x0 ),	/* 0 */
+/* 338 */	NdrFcShort( 0x0 ),	/* 0 */
+/* 340 */	NdrFcShort( 0x0 ),	/* 0 */
+
+/* 342 */	NdrFcShort( 0x10b ),
+/* 344 */	NdrFcShort( 0x8 ),
+/* 346 */	NdrFcShort( 0x10 ),
+
+/* 348 */	NdrFcShort( 0x48 ),
+/* 350 */	NdrFcShort( 0x10 ),
+/* 352 */	0x8,
+			0x0,
+
+/* 354 */	NdrFcShort( 0x2150 ),
+/* 356 */	NdrFcShort( 0x18 ),
+/* 358 */	0x8,
+			0x0,
+
+/* 360 */	NdrFcShort( 0x2013 ),
+/* 362 */	NdrFcShort( 0x20 ),
+/* 364 */	NdrFcShort( 0x6 ),
+
+/* 366 */	NdrFcShort( 0x70 ),
+/* 368 */	NdrFcShort( 0x28 ),
+/* 370 */	0x8,
+			0x0,
+
 			0x0
         }
     };
@@ -514,7 +642,9 @@ static const unsigned short ServiceControl_FormatStringOffsetTable[] =
     78,
     126,
     162,
-    216
+    216,
+    258,
+    312
     };
 
 

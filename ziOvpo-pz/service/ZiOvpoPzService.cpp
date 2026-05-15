@@ -4,6 +4,7 @@
 #include <rpc.h>
 #include <vector>
 #include <string>
+#include <filesystem>
 #include <cstdlib>
 #include <array>
 #include <sstream>
@@ -16,7 +17,9 @@
 #include <Aclapi.h>
 #include <Accctrl.h>
 
+#include "../AvEngine.h"
 #include "../common/AppConfig.h"
+#include "../common/AvDatabaseManager.h"
 #include "../rpc/ServiceControl.h"
 
 #if defined(_M_ARM64) || defined(_M_ARM64EC)
@@ -71,6 +74,8 @@ std::wstring g_deviceMacBase;
 HANDLE g_workerStopEvent = nullptr;
 HANDLE g_workerWakeEvent = nullptr;
 HANDLE g_workerThread = nullptr;
+avstore::AvDatabaseManager g_avManager;
+ULONGLONG g_nextAvUpdate = 0;
 
 std::wstring GetSelfDirectory();
 
@@ -1103,11 +1108,119 @@ void LogoutUser()
     UpdateDeviceIdentityForUser(L"");
 }
 
+bool IsNetworkAvailable()
+{
+    HINTERNET session = WinHttpOpen(L"ZiOvpoPzService/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!session)
+    {
+        return false;
+    }
+
+    HINTERNET connect = WinHttpConnect(session, L"192.168.31.191", 8443, 0);
+    const bool available = connect != nullptr;
+    if (connect)
+    {
+        WinHttpCloseHandle(connect);
+    }
+    WinHttpCloseHandle(session);
+    return available;
+}
+
+bool DownloadAvDatabase(std::vector<BYTE>& bytes)
+{
+    HttpResponse response{};
+    if (!SendHttpsRequest(L"GET", kAvBasesLatestPath, {}, L"", response) || response.status != 200)
+    {
+        LogMessage(L"AV update download failed, status=" + std::to_wstring(response.status));
+        return false;
+    }
+
+    bytes.assign(response.body.begin(), response.body.end());
+    return !bytes.empty();
+}
+
+bool TryUpdateAvBases(bool forceUpdate)
+{
+    const ULONGLONG now = GetNowFileTime();
+    if (!forceUpdate && now < g_nextAvUpdate)
+    {
+        return true;
+    }
+
+    if (!IsNetworkAvailable())
+    {
+        LogMessage(L"AV update skipped: network unavailable");
+        return false;
+    }
+
+    LogMessage(forceUpdate ? L"AV: forced update started" : L"AV: scheduled update started");
+    g_avManager.BackupCurrent();
+
+    std::vector<BYTE> downloaded;
+    if (!DownloadAvDatabase(downloaded))
+    {
+        return false;
+    }
+
+    if (!g_avManager.SaveDownloadedBytes(downloaded))
+    {
+        LogMessage(L"AV update failed to save downloaded database");
+        g_avManager.RollbackToBackup();
+        return false;
+    }
+
+    const avstore::LoadReport report = g_avManager.ReloadCurrentFromDisk();
+    if (report.status != avstore::LoadStatus::Ok && report.status != avstore::LoadStatus::PartialRecordsLoaded)
+    {
+        LogMessage(L"AV update reload failed, rolling back");
+        g_avManager.RollbackToBackup();
+        return false;
+    }
+
+    g_nextAvUpdate = now + static_cast<ULONGLONG>(kAvUpdateIntervalHours) * 60ULL * 60ULL * 10000000ULL;
+    LogMessage(L"AV update completed, records=" + std::to_wstring(report.recordsLoaded));
+    return true;
+}
+
+void EnsureBundledAvDataInstalled()
+{
+    const auto current = avstore::GetCurrentDatabasePath();
+    if (std::filesystem::exists(current))
+    {
+        return;
+    }
+
+    if (avstore::InstallBundledDefaultDatabase())
+    {
+        LogMessage(L"AV: installed bundled default database");
+    }
+}
+
+void InitializeAvStorage()
+{
+    EnsureBundledAvDataInstalled();
+    const avstore::LoadReport report = g_avManager.LoadStartupDatabase();
+    if (report.status == avstore::LoadStatus::ManifestSignatureFailed)
+    {
+        g_nextAvUpdate = GetNowFileTime();
+        LogMessage(L"AV: manifest failure, scheduling forced update");
+    }
+    else
+    {
+        g_nextAvUpdate = GetNowFileTime() + static_cast<ULONGLONG>(kAvUpdateIntervalHours) * 60ULL * 60ULL * 10000000ULL;
+    }
+}
+
 DWORD ComputeNextWakeMs()
 {
     ULONGLONG now = GetNowFileTime();
     ULONGLONG next = now + 30ULL * 10000000ULL;
     const ULONGLONG skew = 60ULL * 10000000ULL;
+
+    if (g_nextAvUpdate < next)
+    {
+        next = g_nextAvUpdate;
+    }
 
     EnterCriticalSection(&g_lock);
     if (g_authState.isAuthenticated)
@@ -1212,6 +1325,22 @@ DWORD WINAPI BackgroundWorkerThread(LPVOID)
                 EnterCriticalSection(&g_lock);
                 ClearLicenseState();
                 LeaveCriticalSection(&g_lock);
+            }
+        }
+
+        const bool forceUpdate = g_avManager.NeedsForcedUpdate();
+        if (forceUpdate || now >= g_nextAvUpdate)
+        {
+            if (!TryUpdateAvBases(forceUpdate))
+            {
+                if (forceUpdate && IsNetworkAvailable())
+                {
+                    LogMessage(L"AV: forced update failed");
+                }
+            }
+            else if (forceUpdate)
+            {
+                g_avManager.SetManifestFailurePending(false);
             }
         }
     }
@@ -1651,6 +1780,75 @@ long RpcActivate(handle_t, const wchar_t* activationKey)
     return ERROR_SUCCESS;
 }
 
+long RpcGetAvDatabaseInfo(handle_t, long* isLoaded, wchar_t** releaseDate, long* recordCount)
+{
+    if (!isLoaded || !releaseDate || !recordCount)
+    {
+        return ERROR_INVALID_PARAMETER;
+    }
+
+    *isLoaded = g_avManager.IsLoaded() ? 1 : 0;
+    *recordCount = static_cast<long>(g_avManager.RecordCount());
+
+    const av::AvDatabase database = g_avManager.Snapshot();
+    const std::wstring text = g_avManager.IsLoaded() ? av::FormatReleaseDate(database.releaseDate) : L"-";
+    *releaseDate = reinterpret_cast<wchar_t*>(MIDL_user_allocate((text.size() + 1) * sizeof(wchar_t)));
+    if (!*releaseDate)
+    {
+        return ERROR_OUTOFMEMORY;
+    }
+
+    wcscpy_s(*releaseDate, text.size() + 1, text.c_str());
+    return ERROR_SUCCESS;
+}
+
+long RpcScanPath(handle_t, const wchar_t* path, long isFolder, long* infected, wchar_t** summary)
+{
+    if (!path || !infected || !summary)
+    {
+        return ERROR_INVALID_PARAMETER;
+    }
+
+    if (!g_avManager.IsLoaded())
+    {
+        return ERROR_NOT_READY;
+    }
+
+    const av::AvDatabase database = g_avManager.Snapshot();
+    std::vector<av::ScanFinding> findings;
+    *infected = 0;
+    std::wstring text;
+
+    if (isFolder != 0)
+    {
+        text = av::ScanFolder(path, database, findings);
+        *infected = findings.empty() ? 0 : 1;
+    }
+    else
+    {
+        av::ScanFinding finding{};
+        if (av::ScanFile(path, database, finding) && finding.infected)
+        {
+            findings.push_back(finding);
+            *infected = 1;
+            text = L"Файл признан вредоносным.";
+        }
+        else
+        {
+            text = L"Вредоносные сигнатуры не найдены.";
+        }
+    }
+
+    *summary = reinterpret_cast<wchar_t*>(MIDL_user_allocate((text.size() + 1) * sizeof(wchar_t)));
+    if (!*summary)
+    {
+        return ERROR_OUTOFMEMORY;
+    }
+
+    wcscpy_s(*summary, text.size() + 1, text.c_str());
+    return ERROR_SUCCESS;
+}
+
 DWORD WINAPI ServiceHandler(DWORD control, DWORD eventType, LPVOID eventData, LPVOID)
 {
     if (control == SERVICE_CONTROL_SESSIONCHANGE && eventType == WTS_SESSION_LOGON)
@@ -1691,6 +1889,8 @@ void WINAPI ServiceMain(DWORD, LPWSTR*)
         DeleteCriticalSection(&g_lock);
         return;
     }
+
+    InitializeAvStorage();
 
     g_workerStopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     g_workerWakeEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
